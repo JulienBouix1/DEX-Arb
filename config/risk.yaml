@@ -1,0 +1,216 @@
+# -------------------------------------------------------------------------
+# 0. Venues Configuration
+# -------------------------------------------------------------------------
+hyperliquid:
+  rest_url: "https://api.hyperliquid.xyz"
+  ws_url: "wss://api.hyperliquid.xyz/ws"
+  min_qty_usd: 12.0
+  fees:
+    taker_bps: 4.0   # Taker fee (Hyperliquid VIP/standard)
+    maker_bps: 1.0   # Maker fee
+
+aster:
+  rest_url: "https://fapi.binance.com"  # Example (Aster uses Binance Futures protocol?)
+  ws_url: "wss://fstream.binance.com/stream"
+  min_qty_usd: 10.0
+  fees:
+    taker_bps: 3.5
+    maker_bps: 1.0
+
+lighter:
+  enabled: true
+  rest_url: "https://mainnet.zklighter.elliot.ai"
+  ws_url: "wss://mainnet.zklighter.elliot.ai/stream"
+  # Credentials loaded from environment variables (see .env.example)
+  api_key_env: "LIGHTER_API_KEY"
+  private_key_env: "LIGHTER_PRIVATE_KEY"
+  account_index_env: "LIGHTER_ACCOUNT_INDEX"
+  api_key_index_env: "LIGHTER_API_KEY_INDEX"
+  l1_address_env: "LIGHTER_L1_ADDRESS"
+  min_qty_usd: 10.0
+  fees:
+    taker_bps: 2.0    # 0.02%
+    maker_bps: 0.2    # 0.002%
+
+# -------------------------------------------------------------------------
+# 1. Capital Allocation & Global Mode
+# -------------------------------------------------------------------------
+# Global mode for Scalp Strategy
+paper_mode: true
+
+# SCALP STRATEGY MASTER SWITCH
+# Set to false to completely disable scalp discovery and trading
+scalp_enabled: false
+
+# Starting equity for paper mode (USD) - used for compounding simulation
+scalp_paper_equity: 1000.0
+
+# Fraction de l'equity dispo à utiliser par trade pour le SCALP (ex: 0.05 = 5%)
+# Reduit de 10% à 5% pour respecter la limite de 20% total scalp (permet 4 trades simultanés)
+alloc_frac_per_trade: 0.05
+
+# Allocation totale maximum pour le Scalp (20%)
+max_scalp_total_alloc_pct: 0.20
+
+# Bornes minimales et maximales par trade (en USD notionnel)
+notional_per_trade_min: 12.0
+notional_per_trade_max: 200.0
+
+# -------------------------------------------------------------------------
+# 2. Execution / Slippage (Scalp)
+# -------------------------------------------------------------------------
+# Spread minimum requis pour entrer en trade (base points)
+spread_entry_bps: 40.0
+
+# Buffer de sécurité pour le slippage (bps)
+slippage_bps_buffer: 2.0
+
+# Délai maximum pour attendre le "flatten" (fermeture) d'une patte
+flatten_timeout_s: 15.0
+
+# Frais de sortie estimés (pour le calcul du roundtrip)
+estimated_exit_fees_bps: 7.0
+
+# Age maximum des données BBO (ms) - Stricter safety
+max_bbo_age_ms: 500.0
+
+# Slippage minimum à appliquer (bps)
+min_slippage_bps: 5.0
+
+# Spread maximum par venue (%)
+max_spread_pct: 1.0
+
+# Temps minimum entre deux opportunités (tous symboles confondus)
+min_trade_gap_s: 0.5
+
+# Cooldown par symbole en secondes
+symbol_cooldown_s: 10.0
+
+# Nombre de ticks consécutifs requis où l'opportunité est présente
+required_confirms: 1
+
+# Edge maximum accepté (bps)
+max_edge_bps: 150.0
+
+# Volatilité instantanée max acceptée (bps sur 5 sec)
+max_volatility_bps: 50.0
+
+# -------------------------------------------------------------------------
+# 3. Pair Discovery / Sanity Filter
+# -------------------------------------------------------------------------
+sanity_filter:
+  max_wait_s: 45.0
+  rel_tol: 0.50
+
+# Volume minimum 24h en USD
+min_volume_24h_usd: 150000.0
+
+# -------------------------------------------------------------------------
+# 4. Carry Strategy (Funding Rate Arbitrage)
+# -------------------------------------------------------------------------
+carry:
+  enabled: true
+
+  # Independent Carry mode (Testing)
+  paper_mode: false
+  paper_equity: 1000.0
+
+  # Dry-run live mode: executes full flow but doesn't place real orders
+  # Use this to validate before going live (set paper_mode: false, dry_run_live: true)
+  dry_run_live: true  # LIVE MODE ENABLED
+  
+  # Yield Selection: Only enter if net edge (after ~15bps fees) is significant
+  min_funding_bps: 50.0  # Min edge in bps per 8h (Increased from 15.0 to survive slippage)
+  
+  # Basis Risk Management (bps)
+  mtm_stop_bps: 100.0    # Stop loss: 100bps basis widening (Increased to reduce churn)
+  mtm_tp_bps: 150.0      # Take profit: 150bps (was 400bps - too conservative)
+  mtm_tp_pct: 0.01       # Take profit at 1% of size_usd (was 2% - too conservative)
+  mtm_grace_minutes: 30.0 # Grace period to let spread settle
+  mtm_yield_multiplier: 5.0 # Higher multiplier allows more basis room for high-yield pairs
+  mtm_check_interval_s: 30.0 # How often to check/log MTM (Default: 30s)
+  tick_interval_s: 2.0 # Carry loop tick interval (Default: 5s, reduced since scalp is disabled)
+  funding_check_interval_s: 15.0 # How often to scan for new carry opportunities (Default: 30s, reduced for faster discovery)
+
+  # Trailing Profit Protection
+  mtm_trailing_bps: 100.0     # Exit if MTM drops 100bps from peak (tightened from 150)
+  mtm_trailing_min_bps: 100.0 # Activation threshold: only trail once profit > 100bps
+  
+  # Hold Parameters
+  max_position_usd: 500.0
+  hold_min_hours: 8.0    # Protect against funding reversal noise
+  hold_max_hours: 24.0
+  
+  # Persistence check: count of funding check ticks
+  required_confirms: 2
+  
+  # Allocation
+  carry_alloc_pct: 0.10
+  max_carry_total_alloc_pct: 0.80
+  
+  # Scaling (Renforcement)
+  scale_up_slice_pct: 0.10   # Size of each reinforcement (10% of equity)
+  max_symbol_alloc_pct: 0.30 # Max exposure per single pair (30% of equity)
+  max_scale_ups_per_position: 2  # Max scale-ups per position (total 3 entries: 1 initial + 2 scale-ups)
+  max_pairs_with_scaleup: 2  # Max number of pairs that can have scale-ups (unlimited positions allowed)
+
+  # Leverage Settings (Live Mode Safety)
+  leverage: 3  # Default leverage for carry positions (lower = safer, 2-5 recommended)
+
+  # Yield Optimization
+  optimization_buffer_bps: 20.0
+  
+  # Liquidity Filter
+  min_volume_24h_usd: 150000.0     # Absolute floor (Exclude anything < 150k$)
+  min_volume_premium_usd: 500000.0   # Tier: Vol < 500k$ requires high yield
+  premium_funding_bps: 120.0       # Yield required for mid-liquidity pairs (120bps)
+
+  # Auto-Blocklist: Block volatile pairs after too many reversals
+  reversal_blocklist_threshold: 2   # N reversals in window triggers blocklist
+  reversal_window_hours: 2.0        # Time window to count reversals
+  reversal_blocklist_hours: 48.0    # How long to block the pair
+
+# -------------------------------------------------------------------------
+# 5. Scalp Position Management (Exit Strategy)
+# -------------------------------------------------------------------------
+# AUDIT FIX: Adjusted Risk/Reward ratio from 6.7:1 to ~2:1
+# Old: stop_loss=100bps, take_profit=~15bps (6.7:1 risk:reward)
+# New: stop_loss=50bps, take_profit_pct=0.30 (~30% of 40bps entry = 12bps)
+#      -> 50:12 = 4:1 risk:reward (still conservative, but manageable)
+# Also increased min_profit_bps to ensure trades cover round-trip fees
+scalp_management:
+  # Stop-Loss: Coupure rapide si la basis s'écarte trop (bps)
+  # REDUCED from 100 to 50bps - tighter stops prevent large losses
+  stop_loss_bps: 50.0
+
+  # Take-Profit: % de la basis d'entrée à capturer
+  # INCREASED from 0.15 to 0.30 - aim to capture more of the spread
+  take_profit_pct: 0.15
+
+  # Profit Minimum (bps): Doit couvrir les frais roundtrip (~14bps) + extra margin
+  # Reduced slightly since we're being more aggressive on take profit
+  min_profit_bps: 25.0
+
+  # Timeout: Temps max de détention avant sortie forcée (heures)
+  max_hold_hours: 0.167 # 10 minutes
+
+# -------------------------------------------------------------------------
+# 6. Global Risk Control (Kill Switch)
+# -------------------------------------------------------------------------
+global:
+  # Max session drawdown allowed
+  max_drawdown_pct: 5.0
+
+  # Max total notional exposure (USD)
+  max_total_notional_usd: 5000.0
+
+# -------------------------------------------------------------------------
+# 7. Remote Access (Dashboard via Cloudflare Tunnel)
+# -------------------------------------------------------------------------
+remote_access:
+  # Enable auto-start of Cloudflare tunnel for remote dashboard access
+  enabled: true  # Auto-start tunnel on bot launch
+  dashboard_port: 8081  # Port your dashboard runs on (must match Dashboard port)
+  # Note: Requires cloudflared to be installed:
+  #   Windows: winget install cloudflare.cloudflared
+  #   Mac: brew install cloudflare/cloudflare/cloudflared

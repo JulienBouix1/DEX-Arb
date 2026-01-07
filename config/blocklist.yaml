@@ -1,0 +1,43 @@
+# config/blocklist.yaml
+# Centralise les actifs/symboles à BLOQUER en LIVE (et en DRY si tu veux),
+# pour éviter les unit mismatches et tokens à levier.
+#
+# Règles de bon sens :
+# - ZKC et 2Z : bloqués
+# - Tous les k-tokens non validés : bloqués par défaut
+# - Tokens levier 3L/3S/5L/5S : bloqués
+# - Stables, indices, actions tokenisées : déjà filtrés ailleurs, mais on peut redonder ici.
+
+blocked_bases:
+  # Mismatches connus
+  - "ZKC"
+  - "2Z"
+  - "DYDX"
+
+bases:
+  - "DYDX"
+
+  # k-tokens non validés : KXXXX => bloqués par défaut
+  - "^K[A-Z0-9]+$"
+
+  # Leverage tokens (suffixes courants)
+  - ".*3L$"
+  - ".*3S$"
+  - ".*5L$"
+  - ".*5S$"
+
+# Option : si tu souhaites autoriser certains k-tokens après validation,
+# décommente et liste explicitement :
+# allowlist_bases:
+#   - "KNEIRO"   # ex: validé manuellement
+
+# Symboles entiers bloqués explicitement (noms exacts)
+blocked_symbols:
+  - "STABLEUSDT"  # Problème de liquidité/manipulation connu
+
+# Option : expressions sur symboles entiers côté venues (si besoin)
+blocked_symbols_regex:
+  # Exemples :
+  - "^.*DOWNUSDT$"
+  - "^.*UPUSDT$"
+

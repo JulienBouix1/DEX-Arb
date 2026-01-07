@@ -1,0 +1,7 @@
+active:
+  - OPENUSDT
+
+symbol_map:
+  OPENUSDT:
+    hyperliquid: OX
+    aster: OPENUSDT

@@ -1,0 +1,42 @@
+notifier:
+  kind: "discord"
+  # pas d'URL en clair ici
+  username: "arb-bot"
+  avatar_url: ""
+
+hyperliquid:
+  rest_url: "https://api.hyperliquid.xyz"
+  ws_url: "wss://api.hyperliquid.xyz/ws"
+  # Credentials loaded from environment variables (see .env.example)
+  user_address_env: "HL_USER_ADDRESS"
+  private_key_env: "HL_PRIVATE_KEY"
+  fees:
+    maker_bps: 1.5
+    taker_bps: 4.5
+  min_qty_usd: 10
+  ioc_guard_bps: 8
+
+
+aster:
+  rest_url: "https://fapi.asterdex.com"
+  ws_url: "wss://fstream.asterdex.com/stream"
+  # Fees Aster Perp Pro (doc publique)
+  fees:
+    maker_bps: 0.5      # 0.005%
+    taker_bps: 4.0      # 0.04%
+  min_qty_usd: 10
+
+lighter:
+  enabled: true
+  rest_url: "https://mainnet.zklighter.elliot.ai"
+  ws_url: "wss://mainnet.zklighter.elliot.ai/stream"
+  # Credentials loaded from environment variables (see .env.example)
+  private_key_env: "LIGHTER_PRIVATE_KEY"
+  api_key_env: "LIGHTER_API_KEY"
+  account_index_env: "LIGHTER_ACCOUNT_INDEX"
+  api_key_index_env: "LIGHTER_API_KEY_INDEX"
+  l1_address_env: "LIGHTER_L1_ADDRESS"
+  fees:
+    maker_bps: 0.0
+    taker_bps: 5.0
+  min_qty_usd: 10

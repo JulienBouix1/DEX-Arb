@@ -1,0 +1,26 @@
+# =============================================================================
+# Python Dependencies - Trading Bot
+# =============================================================================
+# Install with: pip install -r requirements.txt
+# =============================================================================
+
+# Core async/HTTP
+aiohttp>=3.8.0
+websockets>=10.0
+
+# Ethereum/Web3
+eth-account>=0.8.0
+
+# Exchange SDKs
+hyperliquid-python-sdk>=0.3.0
+lighter-sdk>=1.0.0  # Official Lighter SDK (NOT lighter-v2-python)
+
+# Configuration
+pyyaml>=6.0
+python-dotenv>=1.0.0
+
+# Data processing
+numpy>=1.21.0
+
+# Utilities
+requests>=2.28.0

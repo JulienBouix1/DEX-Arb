@@ -1,0 +1,1 @@
+Fix: eff_adj_bps sign bug. Compute as abs(net_mid_bps) - depth_slip_bps. Side_sign used only for direction.
