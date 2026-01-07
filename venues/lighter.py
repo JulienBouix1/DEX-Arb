@@ -326,7 +326,9 @@ class Lighter:
             self._schedule_leverage_retry()
 
     def _schedule_leverage_retry(self) -> None:
-        """Schedule a background task to retry failed leverage setups."""
+        """Schedule a background task to retry failed leverage setups. DISABLED."""
+        # DISABLED: Leverage API calls drain quota
+        return
         if self._leverage_retry_task and not self._leverage_retry_task.done():
             return  # Already scheduled
         self._leverage_retry_task = asyncio.create_task(self._retry_failed_leverage())
@@ -538,8 +540,14 @@ class Lighter:
     async def set_leverage(self, symbol: str, leverage: int = 5) -> bool:
         """
         Set leverage for Lighter using SDK SignerClient.
-        Implements fallback logic (leverage, 3x, 2x) and rate limit handling.
+        DISABLED: Leverage calls drain volume quota and always fail.
+        Assumes leverage is pre-configured on the account.
         """
+        # DISABLED: Leverage API calls drain quota and fail
+        # Assume leverage is already configured on Lighter account
+        log.debug(f"[Lighter] Leverage setup disabled for {symbol} (assumes pre-configured)")
+        return True
+
         if not self._sdk_client:
             log.warning(f"[Lighter] SDK client not available - cannot set leverage for {symbol}")
             return False

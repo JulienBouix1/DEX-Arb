@@ -442,6 +442,10 @@ class Dashboard:
                         <div style="color:#888">Realized PnL</div>
                         <div class="val" id="carry_realized">$0.00</div>
                     </div>
+                    <div class="metric">
+                        <div style="color:#888">Unrealized MTM</div>
+                        <div class="val" id="carry_unrealized2">$0.00</div>
+                    </div>
                 </div>
 
                 <!-- Live Mode: Real Equity by Venue -->

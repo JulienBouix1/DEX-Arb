@@ -158,7 +158,7 @@ carry:
   leverage: 3  # Default leverage for carry positions (lower = safer, 2-5 recommended)
 
   # Yield Optimization
-  optimization_buffer_bps: 20.0
+  optimization_buffer_bps: 15.0
   
   # Liquidity Filter
   min_volume_24h_usd: 150000.0     # Absolute floor (Exclude anything < 150k$)

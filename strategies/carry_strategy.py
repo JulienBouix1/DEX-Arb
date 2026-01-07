@@ -122,6 +122,10 @@ class CarryStrategy:
         self.mtm_trailing_bps = float(risk.get("carry", {}).get("mtm_trailing_bps", 150.0))
         self.mtm_trailing_min = float(risk.get("carry", {}).get("mtm_trailing_min_bps", 100.0))
 
+        # Leverage Settings (CRITICAL for live trading)
+        self.leverage = int(risk.get("carry", {}).get("leverage", 3))
+        self._leverage_setup_done: Dict[str, bool] = {}  # Track which symbols have had leverage set
+
         # Liquidity-Aware Entry (Dynamic Threshold)
         self.min_vol_premium = float(risk.get("carry", {}).get("min_volume_premium_usd", 500000.0))
         self.premium_funding_bps = float(risk.get("carry", {}).get("premium_funding_bps", 120.0))
@@ -150,6 +154,9 @@ class CarryStrategy:
         self.paper_equity = self.storage.load_paper_equity(default=config_equity)
         if self.paper_equity != config_equity:
             log.info(f"[CARRY] Restored paper_equity: ${self.paper_equity:.2f} (config: ${config_equity:.2f})")
+
+        # Dry-run simulated PnL (separate from paper_equity to avoid contamination)
+        self._dry_run_realized_pnl = 0.0
 
         # Equity Cache to avoid redundant API calls
         self._cached_total_equity = 0.0
@@ -304,6 +311,12 @@ class CarryStrategy:
     def _log_mtm(self, pos: CarryPosition, mtm: Dict[str, float], curr_px1: float, curr_px2: float) -> None:
         """Log real-time MTM for position tracking."""
         try:
+            # Use correct equity based on mode
+            if self.paper_mode:
+                equity = self.total_paper_equity
+            else:
+                equity = self._cached_total_equity if self._cached_total_equity > 0 else self.total_paper_equity
+
             with open(self._mtm_csv_path, "a", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
                 hold_hours = (time.time() - pos.entry_time) / 3600.0
@@ -313,7 +326,7 @@ class CarryStrategy:
                     f"{curr_px1:.4f}", f"{curr_px2:.4f}",
                     f"{mtm['price_pnl_usd']:.4f}", f"{mtm['funding_pnl_usd']:.4f}",
                     f"{mtm['total_mtm_usd']:.4f}", f"{mtm['mtm_bps']:.2f}",
-                    f"{pos.entry_diff_bps:.2f}", f"{self.total_paper_equity:.2f}"
+                    f"{pos.entry_diff_bps:.2f}", f"{equity:.2f}"
                 ])
         except Exception:
             pass
@@ -890,15 +903,21 @@ class CarryStrategy:
             pos_data = []
             for sym, pos in self.positions.items():
                 mtm = self._calc_mtm(pos)
+                # Use accrued_funding as fallback for profitability if MTM calc returns 0
+                # (happens when BBO unavailable)
+                total_pnl = mtm["total_mtm_usd"]
+                is_profitable = total_pnl > 0 or pos.accrued_funding_usd > 0.01  # Any meaningful accrued funding
                 pos_data.append({
                     "sym": sym,
                     "pos": pos,
                     "yield_bps": abs(pos.entry_diff_bps),
                     "size_usd": pos.size_usd,
                     "scale_count": pos.scale_up_count,
-                    "total_pnl": mtm["total_mtm_usd"],
-                    "in_profit": mtm["total_mtm_usd"] > 0
+                    "total_pnl": total_pnl,
+                    "in_profit": is_profitable
                 })
+                log.debug(f"[CARRY] REBAL CHECK {pos.hl_coin}: yield={abs(pos.entry_diff_bps):.1f}bps, scale={pos.scale_up_count}, "
+                         f"mtm=${total_pnl:.2f}, accrued=${pos.accrued_funding_usd:.2f}, in_profit={is_profitable}")
 
             # Sort by yield (highest first)
             pos_data.sort(key=lambda x: x["yield_bps"], reverse=True)
@@ -918,8 +937,10 @@ class CarryStrategy:
                         continue  # Not oversized (never scaled up)
                     if not low_yield["in_profit"]:
                         continue  # Only scale down if in profit
-                    if low_yield["yield_bps"] >= high_yield["yield_bps"] - self.opt_buffer:
-                        continue  # Yield difference not significant enough
+                    # Check if high_yield is significantly better than low_yield
+                    # Rebalance if: high_yield > low_yield + buffer (meaningful improvement)
+                    if high_yield["yield_bps"] <= low_yield["yield_bps"] + self.opt_buffer:
+                        continue  # High-yield not significantly better than low-yield
 
                     # Found a rebalance opportunity!
                     log.info(f"[CARRY] YIELD REBALANCE [{rebalance_count+1}]: {high_yield['pos'].hl_coin} ({high_yield['yield_bps']:.1f}bps) "
@@ -932,6 +953,13 @@ class CarryStrategy:
                     if success:
                         rebalance_count += 1
                         found_opportunity = True
+
+                        # Trigger immediate scale-up on the high-yield position
+                        high_pos = high_yield["pos"]
+                        if high_pos.scale_up_count < self.max_scale_ups_per_position:
+                            log.info(f"[CARRY] YIELD REBALANCE: Triggering scale-up on {high_pos.hl_coin}")
+                            await self._trigger_scale_up(high_pos)
+
                         break  # Re-evaluate positions after change
                     else:
                         return  # Stop if partial exit failed
@@ -944,6 +972,48 @@ class CarryStrategy:
 
         if rebalance_count > 0:
             log.info(f"[CARRY] Yield rebalancing complete: {rebalance_count} scale-down(s) executed")
+
+    async def _trigger_scale_up(self, pos: CarryPosition) -> bool:
+        """
+        Trigger a scale-up on a position after yield rebalancing freed capital.
+        Simplified version that directly increases the position size.
+        """
+        if pos.scale_up_count >= self.max_scale_ups_per_position:
+            return False
+
+        total_equity = await self._get_total_equity()
+        slice_size = total_equity * self.max_carry_alloc_pct * self.scale_up_slice_pct
+
+        # Check max allocation
+        max_sym_alloc = total_equity * self.max_symbol_alloc_pct
+        if pos.size_usd + slice_size > max_sym_alloc:
+            remaining = max_sym_alloc - pos.size_usd
+            if remaining < 10.0:
+                log.info(f"[CARRY] SCALE_UP SKIPPED {pos.hl_coin}: At max allocation")
+                return False
+            slice_size = remaining
+
+        if self.paper_mode or self.dry_run_live:
+            # Paper/Dry-run: Just increase position size
+            pos.size_usd += slice_size
+            pos.scale_up_count += 1
+            self._save_state()
+
+            log.info(f"[CARRY] SCALE_UP SUCCESS {pos.hl_coin}: New Size ${pos.size_usd:.2f} "
+                    f"(scale-up #{pos.scale_up_count}/{self.max_scale_ups_per_position})")
+
+            # Log to carry_audit.csv
+            self._log(
+                pos.symbol, "SCALE_UP_REBAL", pos.direction, slice_size,
+                0.0, 0.0, "REBAL", "REBAL",
+                0.0, 0.0, 0.0, self.paper_equity
+            )
+            return True
+
+        # LIVE MODE would need actual order execution
+        # For now, just log and skip
+        log.warning(f"[CARRY] SCALE_UP in LIVE mode not implemented for yield rebalancing")
+        return False
 
     async def _execute_partial_exit(self, sym: str, size_to_reduce: float, reason: str) -> bool:
         """
@@ -961,7 +1031,7 @@ class CarryStrategy:
         log.info(f"[CARRY] PARTIAL EXIT {sym}: Reducing by ${size_to_reduce:.2f} ({reason})")
 
         # Calculate proportional PnL for the portion being closed
-        mtm = await self._compute_mtm(pos)
+        mtm = self._calc_mtm(pos)
         reduction_ratio = size_to_reduce / pos.size_usd
         partial_pnl = mtm["total_mtm_usd"] * reduction_ratio
 
@@ -980,6 +1050,13 @@ class CarryStrategy:
                 self.wins += 1
             elif partial_pnl < 0:
                 self.losses += 1
+
+            # Log to carry_audit.csv
+            self._log(
+                sym, "SCALE_DOWN", pos.direction, size_to_reduce,
+                0.0, 0.0, "REBAL", "REBAL",
+                0.0, partial_pnl, 0.0, self.paper_equity
+            )
 
             return True
 
@@ -1019,11 +1096,14 @@ class CarryStrategy:
         qty = size_per_leg / current_px1
 
         # Execute partial closes
+        # CRITICAL: Aster doesn't support reduce_only=True on exit orders
         try:
-            res1 = await v1_obj.place_order(s1, side1, v1_obj.round_qty(s1, qty), ioc=True, reduce_only=True)
+            use_reduce_only_v1 = v1_name != "AS"
+            use_reduce_only_v2 = v2_name != "AS"
+            res1 = await v1_obj.place_order(s1, side1, v1_obj.round_qty(s1, qty), ioc=True, reduce_only=use_reduce_only_v1)
             f1 = float(res1.get("filled", 0.0))
 
-            res2 = await v2_obj.place_order(s2, side2, v2_obj.round_qty(s2, qty), ioc=True, reduce_only=True)
+            res2 = await v2_obj.place_order(s2, side2, v2_obj.round_qty(s2, qty), ioc=True, reduce_only=use_reduce_only_v2)
             f2 = float(res2.get("filled", 0.0))
 
             if f1 > 0 and f2 > 0:
@@ -1052,7 +1132,7 @@ class CarryStrategy:
         # BUG FIX: Recalculate PnL if passed as 0,0 (forced exits, retries)
         # This ensures losses ARE counted in paper_equity and W/L stats
         if pnl_price == 0.0 and pnl_funding == 0.0:
-            mtm = await self._compute_mtm(pos)
+            mtm = self._calc_mtm(pos)
             pnl_price = mtm.get("price_pnl_usd", 0.0)
             pnl_funding = mtm.get("funding_pnl_usd", 0.0)
             log.info(f"[CARRY] Recalculated PnL for {sym}: price=${pnl_price:.2f} funding=${pnl_funding:.2f}")
@@ -1074,7 +1154,7 @@ class CarryStrategy:
 
         if not v1_obj or not v2_obj:
             log.error(f"[CARRY] Exit failed: Unknown venue(s) {v1_name}/{v2_name}")
-            return
+            return False
 
         is_long1 = pos.direction.lower().startswith("long")
         side1 = "SELL" if is_long1 else "BUY"
@@ -1111,9 +1191,10 @@ class CarryStrategy:
             log.info(f"  Leg 1: {v1_name} {s1} {side1} qty={v1_obj.round_qty(s1, qty_v1):.6f} @ ${current_px1:.4f}")
             log.info(f"  Leg 2: {v2_name} {s2} {side2} qty={v2_obj.round_qty(s2, qty_v1):.6f} @ ${current_px2:.4f}")
             log.info(f"  Est PnL: Price=${pnl_price:.2f} Funding=${pnl_funding:.2f} Total=${pnl_price+pnl_funding:.2f}")
-            # In dry-run, we still update paper equity and remove position for tracking
-            self.paper_equity += (pnl_price + pnl_funding)
-            self._remove_position(sym, reason, pnl_price, pnl_funding, self.paper_equity)
+            # In dry-run, track simulated PnL separately (don't contaminate paper_equity)
+            self._dry_run_realized_pnl += (pnl_price + pnl_funding)
+            # Use real equity for tracking in dry-run mode
+            self._remove_position(sym, reason, pnl_price, pnl_funding, self._cached_total_equity)
             return True
 
         # Retry logic for Leg 1 (3 attempts with backoff)
@@ -1121,8 +1202,10 @@ class CarryStrategy:
         for attempt in range(3):
             try:
                 log.info(f"[CARRY] Closing Leg 1 {v1_name} {side1} (attempt {attempt+1}/3)...")
+                # CRITICAL: Aster doesn't support reduce_only=True on exit orders (per CLAUDE.md)
+                use_reduce_only = v1_name != "AS"
                 res1 = await v1_obj.place_order(s1, side1, v1_obj.round_qty(s1, qty_v1),
-                                                ioc=True, reduce_only=True)
+                                                ioc=True, reduce_only=use_reduce_only)
 
                 f1 = float(res1.get("filled", 0.0))
                 if f1 > 0:
@@ -1146,8 +1229,10 @@ class CarryStrategy:
         for attempt in range(3):
             try:
                 log.info(f"[CARRY] Closing Leg 2 {v2_name} {side2} (qty={qty_v2_target}, attempt {attempt+1}/3)...")
+                # CRITICAL: Aster doesn't support reduce_only=True on exit orders (per CLAUDE.md)
+                use_reduce_only_v2 = v2_name != "AS"
                 res2 = await v2_obj.place_order(s2, side2, qty_v2_target,
-                                                ioc=True, reduce_only=True)
+                                                ioc=True, reduce_only=use_reduce_only_v2)
 
                 f2 = float(res2.get("filled", 0.0))
                 if f2 > 0:
@@ -1266,7 +1351,9 @@ class CarryStrategy:
                     log.info(f"[CARRY DRY-RUN] WOULD CLOSE ORPHAN: {v2_name} {s2} {close_side} qty={qty:.6f}")
                 else:
                     log.info(f"[CARRY] Closing orphan leg: {v2_name} {s2} {close_side} qty={qty:.6f}")
-                    res = await v2_obj.place_order(s2, close_side, qty, ioc=True, reduce_only=True)
+                    # CRITICAL: Aster doesn't support reduce_only=True
+                    use_reduce_only = v2_name != "AS"
+                    res = await v2_obj.place_order(s2, close_side, qty, ioc=True, reduce_only=use_reduce_only)
                     filled = float(res.get("filled", 0.0))
 
                     if filled > 0:
@@ -1364,26 +1451,46 @@ class CarryStrategy:
                     except Exception: pass
 
                     # Determine effective threshold: 120bps if < 500k vol, else 50bps
+                    # CRITICAL FIX: For SCALE-UPS (pos exists), use lower threshold since we're already committed
                     effective_threshold = self.min_funding_bps
                     is_premium_tier = hl_vol < self.min_vol_premium
                     if is_premium_tier:
                         effective_threshold = self.premium_funding_bps
 
-                    pair_key = f"{hl_coin}_{v1_n}_{v2_n}"
-                    if net_yield < effective_threshold:
-                        # Log if it has SOME yield (>10bps) so user sees why it was skipped
-                        if abs_diff_bps >= 10.0:
-                            reason = f"Low Net Edge (<{effective_threshold})"
-                            if is_premium_tier and net_yield >= self.min_funding_bps:
-                                 reason = f"Low Liquidity Premium (<{self.premium_funding_bps})"
-
+                    # SCALE-UP THRESHOLD REDUCTION: If we already have a position with good entry yield,
+                    # allow scale-ups at 50% of normal threshold (we're already in the trade)
+                    pair_key = f"{hl_coin}_{v1_n}_{v2_n}"  # Define early for all code paths
+                    is_scale_up = pos is not None and pos.scale_up_count < self.max_scale_ups_per_position
+                    if is_scale_up:
+                        # For scale-ups: require only that current net_yield > 0 (still profitable after fees)
+                        # AND the position's entry yield was good enough when we entered
+                        scale_up_threshold = max(0.0, self.min_funding_bps * 0.5)  # 25 bps minimum for scale-ups
+                        if net_yield >= scale_up_threshold:
+                            log.info(f"[CARRY] SCALE-UP QUALIFIED {hl_coin}: net_yield={net_yield:.1f}bps >= scale_up_threshold={scale_up_threshold:.1f}bps")
+                            # Skip the normal threshold check - proceed to opportunity
+                            pass  # Fall through to add opportunity
+                        else:
+                            # Even scale-up doesn't meet minimum threshold
                             self._log_opp_audit(pair_key, abs_diff_bps, "SKIPPED",
-                                              reason=reason,
+                                              reason=f"Scale-up below min ({scale_up_threshold:.0f}bps)",
                                               details=f"net={net_yield:.1f} vol=${hl_vol/1000:.0f}K slip={slip:.1f}")
-                        # Reset confirmation if opportunity dropped below threshold
-                        if pair_key in self._confirm_count:
-                            self._confirm_count[pair_key] = 0
-                        continue
+                            continue
+                    else:
+                        # NEW ENTRY: Apply full threshold
+                        if net_yield < effective_threshold:
+                            # Log if it has SOME yield (>10bps) so user sees why it was skipped
+                            if abs_diff_bps >= 10.0:
+                                reason = f"Low Net Edge (<{effective_threshold})"
+                                if is_premium_tier and net_yield >= self.min_funding_bps:
+                                     reason = f"Low Liquidity Premium (<{self.premium_funding_bps})"
+
+                                self._log_opp_audit(pair_key, abs_diff_bps, "SKIPPED",
+                                                  reason=reason,
+                                                  details=f"net={net_yield:.1f} vol=${hl_vol/1000:.0f}K slip={slip:.1f}")
+                            # Reset confirmation if opportunity dropped below threshold
+                            if pair_key in self._confirm_count:
+                                self._confirm_count[pair_key] = 0
+                            continue
 
                     direction = f"Short {v1_n} / Long {v2_n}" if raw_diff_bps > 0 else f"Long {v1_n} / Short {v2_n}"
 
@@ -1439,8 +1546,18 @@ class CarryStrategy:
                     continue
             else:
                 # SCALE-UP: Check max scale-ups per position limit (max 2 scale-ups = 3 total entries)
+                # DEBUG: Log scale_up_count to diagnose bypass issue
+                log.info(f"[CARRY] SCALE-UP CHECK {hl_coin}: scale_up_count={existing_pos_for_sym.scale_up_count}, max={self.max_scale_ups_per_position}, size=${existing_pos_for_sym.size_usd:.2f}")
                 if existing_pos_for_sym.scale_up_count >= self.max_scale_ups_per_position:
-                    log.debug(f"[CARRY] Skip SCALE-UP {hl_coin}: max scale-ups reached ({existing_pos_for_sym.scale_up_count}/{self.max_scale_ups_per_position})")
+                    log.warning(f"[CARRY] BLOCKED SCALE-UP {hl_coin}: max scale-ups reached ({existing_pos_for_sym.scale_up_count}/{self.max_scale_ups_per_position})")
+                    continue
+
+                # ABSOLUTE SIZE BLOCK: Regardless of scale_up_count, block if size >= 3x initial slice
+                # This catches any bugs where scale_up_count doesn't increment properly
+                initial_slice = total_equity * self.max_carry_alloc_pct * self.alloc_pct
+                max_position_size = initial_slice * 3.0  # Entry + 2 scale-ups = 3x
+                if existing_pos_for_sym.size_usd >= max_position_size * 0.95:  # 95% tolerance
+                    log.warning(f"[CARRY] SIZE BLOCKED SCALE-UP {hl_coin}: size ${existing_pos_for_sym.size_usd:.2f} >= max ${max_position_size:.2f}")
                     continue
 
                 # SCALE-UP: Check max pairs that can scale-up (only 2 pairs can have scale-ups)
@@ -1480,6 +1597,54 @@ class CarryStrategy:
             # Small delay between entries to avoid rate limiting
             await asyncio.sleep(0.3)
 
+    async def _ensure_leverage_setup(self, venue_name: str, symbol: str, venue_obj) -> bool:
+        """
+        Ensure leverage is properly set for a symbol before placing orders.
+        CRITICAL: Must be called before any live order to avoid margin issues.
+        Returns True if leverage is ready, False if setup failed.
+        """
+        if self.paper_mode or self.dry_run_live:
+            return True  # No need to setup leverage in paper/dry-run mode
+
+        cache_key = f"{venue_name}:{symbol}"
+        if cache_key in self._leverage_setup_done:
+            return self._leverage_setup_done[cache_key]
+
+        try:
+            # Skip Lighter leverage setup (drains quota, per CLAUDE.md)
+            if venue_name == "LT":
+                log.debug(f"[CARRY] Skipping leverage setup for Lighter {symbol} (quota issue)")
+                self._leverage_setup_done[cache_key] = True
+                return True
+
+            if hasattr(venue_obj, 'set_leverage'):
+                result = await venue_obj.set_leverage(symbol, self.leverage)
+                if result:
+                    log.info(f"[CARRY] Leverage {self.leverage}x set for {venue_name} {symbol}")
+                    self._leverage_setup_done[cache_key] = True
+                    return True
+                else:
+                    log.warning(f"[CARRY] Failed to set leverage for {venue_name} {symbol}")
+                    # Don't cache failure - retry next time
+                    return False
+            elif hasattr(venue_obj, 'set_isolated_margin'):
+                result = await venue_obj.set_isolated_margin(symbol, self.leverage)
+                if result:
+                    log.info(f"[CARRY] Isolated margin {self.leverage}x set for {venue_name} {symbol}")
+                    self._leverage_setup_done[cache_key] = True
+                    return True
+                else:
+                    log.warning(f"[CARRY] Failed to set isolated margin for {venue_name} {symbol}")
+                    return False
+            else:
+                log.debug(f"[CARRY] Venue {venue_name} doesn't support leverage setup")
+                self._leverage_setup_done[cache_key] = True
+                return True
+
+        except Exception as e:
+            log.warning(f"[CARRY] Leverage setup error for {venue_name} {symbol}: {e}")
+            return False
+
     async def _execute_smart_entry(self, hl_coin: str, s1: str, s2: str, direction: str,
                                    diff_bps: float, r1: float, r2: float, venues: Tuple[str, str],
                                    all_opportunities: List = None) -> None:
@@ -1501,6 +1666,19 @@ class CarryStrategy:
         existing_pos = self.positions.get(target_sym)
 
         if existing_pos:
+            # CRITICAL: Double-check scale-up limit (should be caught by _check_entries but be safe)
+            log.info(f"[CARRY] SCALE-UP VERIFY {hl_coin}: count={existing_pos.scale_up_count}, max={self.max_scale_ups_per_position}, sym={target_sym}")
+            if existing_pos.scale_up_count >= self.max_scale_ups_per_position:
+                log.warning(f"[CARRY] HARD BLOCK SCALE-UP {hl_coin}: already at max ({existing_pos.scale_up_count}/{self.max_scale_ups_per_position})")
+                return
+
+            # ABSOLUTE BLOCK: Check size-based limit (3 entries = 3x slice_size)
+            # max_size = equity * max_carry_alloc_pct * alloc_pct * 3 (initial + 2 scale-ups)
+            max_expected_size = total_equity * self.max_carry_alloc_pct * self.alloc_pct * 3.0
+            if existing_pos.size_usd >= max_expected_size:
+                log.warning(f"[CARRY] SIZE BLOCK SCALE-UP {hl_coin}: position size ${existing_pos.size_usd:.2f} already >= max ${max_expected_size:.2f}")
+                return
+
             # SMART SCALE-UP: Check if there's a better opportunity without a position
             # If yes, skip scale-up to allocate capital to the better opportunity instead
             if all_opportunities:
@@ -1590,6 +1768,11 @@ class CarryStrategy:
             prices["v2"] = p2
         else:
             # LIVE SMART ENTRY / SCALE UP WITH RETRY
+
+            # CRITICAL: Setup leverage before placing orders (only once per symbol)
+            await self._ensure_leverage_setup(v1_n, s1, v1_obj)
+            await self._ensure_leverage_setup(v2_n, s2, v2_obj)
+
             # Use get_fresh_bbo for Lighter (has REST fallback if WS stale)
             if v1_n == "LT" and hasattr(v1_obj, 'get_fresh_bbo'):
                 bbo1 = await v1_obj.get_fresh_bbo(s1)
@@ -1655,9 +1838,11 @@ class CarryStrategy:
                 # ATOMIC ROLLBACK
                 log.error(f"[CARRY] CRITICAL: Leg 2 {s2} failed after 2 attempts. ROLLING BACK Leg 1.")
                 inv_side = "SELL" if side1 == "BUY" else "BUY"
+                # CRITICAL: Aster doesn't support reduce_only=True
+                use_reduce_only_rb = v1_n != "AS"
                 for rb_attempt in range(3):
                     try:
-                        rb_res = await v1_obj.place_order(s1, inv_side, v1_obj.round_qty(s1, f1), ioc=True, reduce_only=True)
+                        rb_res = await v1_obj.place_order(s1, inv_side, v1_obj.round_qty(s1, f1), ioc=True, reduce_only=use_reduce_only_rb)
                         if float(rb_res.get("filled", 0.0)) > 0:
                             log.info(f"[CARRY] Rollback successful")
                             break
@@ -1740,7 +1925,8 @@ class CarryStrategy:
                 "funding_pnl_usd": mtm["funding_pnl_usd"],
                 "price_pnl_usd": mtm["price_pnl_usd"],
                 "total_mtm_usd": mtm["total_mtm_usd"],
-                "entry_funding_diff_bps": pos.entry_diff_bps
+                "entry_funding_diff_bps": pos.entry_diff_bps,
+                "scale_up_count": pos.scale_up_count
             })
         return summary
 
