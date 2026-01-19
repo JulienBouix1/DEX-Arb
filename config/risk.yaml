@@ -1,5 +1,9 @@
 # -------------------------------------------------------------------------
-# 0. Venues Configuration
+# 0. Venues Configuration (DEPRECATED - use config/venues.yaml instead)
+# -------------------------------------------------------------------------
+# NOTE: This section duplicates config/venues.yaml and should be removed.
+# The authoritative venue configuration is in venues.yaml.
+# This section is kept for backward compatibility but may be removed in future.
 # -------------------------------------------------------------------------
 hyperliquid:
   rest_url: "https://api.hyperliquid.xyz"
@@ -117,25 +121,35 @@ carry:
 
   # Dry-run live mode: executes full flow but doesn't place real orders
   # Use this to validate before going live (set paper_mode: false, dry_run_live: true)
-  dry_run_live: true  # LIVE MODE ENABLED
+  dry_run_live: false  # LIVE MODE - REAL ORDERS
   
-  # Yield Selection: Only enter if net edge (after ~15bps fees) is significant
-  min_funding_bps: 50.0  # Min edge in bps per 8h (Increased from 15.0 to survive slippage)
-  
+  # Yield Selection: Liquidity-tiered entry thresholds
+  min_funding_bps: 40.0  # Min edge for HIGH-VOLUME pairs (vol > min_volume_premium_usd)
+
   # Basis Risk Management (bps)
   mtm_stop_bps: 100.0    # Stop loss: 100bps basis widening (Increased to reduce churn)
-  mtm_tp_bps: 150.0      # Take profit: 150bps (was 400bps - too conservative)
-  mtm_tp_pct: 0.01       # Take profit at 1% of size_usd (was 2% - too conservative)
+  mtm_tp_bps: 150.0      # Take profit: 150bps (fallback for windfall scenarios)
   mtm_grace_minutes: 30.0 # Grace period to let spread settle
   mtm_yield_multiplier: 5.0 # Higher multiplier allows more basis room for high-yield pairs
+  mtm_multiplier_window_hours: 1.0 # Multiplier only applies for first N hours, then hard stop kicks in
   mtm_check_interval_s: 30.0 # How often to check/log MTM (Default: 30s)
   tick_interval_s: 2.0 # Carry loop tick interval (Default: 5s, reduced since scalp is disabled)
   funding_check_interval_s: 15.0 # How often to scan for new carry opportunities (Default: 30s, reduced for faster discovery)
 
+  # Tiered Take-Profit System
+  high_yield_threshold_bps: 100.0  # Pairs above this are "high-yield"
+  high_yield_tp_pct_initial: 0.02  # High-yield: 2% TP initially
+  high_yield_tp_pct_after_4h: 0.01 # High-yield: 1% TP after 4 hours
+  high_yield_tp_decay_hours: 4.0   # Hours after which TP % decreases
+  # NOTE: Fees are now loaded dynamically from venues.yaml (taker_bps per venue)
+
   # Trailing Profit Protection
   mtm_trailing_bps: 100.0     # Exit if MTM drops 100bps from peak (tightened from 150)
   mtm_trailing_min_bps: 100.0 # Activation threshold: only trail once profit > 100bps
-  
+
+  # Early Reversal Detection
+  early_reversal_min_minutes: 5.0  # Min hold time before early reversal exit (was 10 min)
+
   # Hold Parameters
   max_position_usd: 500.0
   hold_min_hours: 8.0    # Protect against funding reversal noise
@@ -157,8 +171,9 @@ carry:
   # Leverage Settings (Live Mode Safety)
   leverage: 3  # Default leverage for carry positions (lower = safer, 2-5 recommended)
 
-  # Yield Optimization
-  optimization_buffer_bps: 15.0
+  # Yield Optimization / Rebalancing
+  optimization_buffer_bps: 15.0      # Yield difference required to trigger rebalancing
+  rebalance_min_profit_bps: 10.0     # Minimum profit (bps) before allowing rebalancing
   
   # Liquidity Filter
   min_volume_24h_usd: 150000.0     # Absolute floor (Exclude anything < 150k$)
@@ -169,6 +184,12 @@ carry:
   reversal_blocklist_threshold: 2   # N reversals in window triggers blocklist
   reversal_window_hours: 2.0        # Time window to count reversals
   reversal_blocklist_hours: 48.0    # How long to block the pair
+
+  # V2 Retry Recovery (FIX 2026-01-09)
+  # When V1 succeeds but V2 fails, retry V2 if edge still profitable
+  v2_retry_max_attempts: 3          # Additional V2 attempts after initial failure
+  v2_retry_window_sec: 10.0         # Max time window for retry attempts
+  v2_edge_decay_threshold: 0.80     # Retry only if edge >= 80% of original
 
 # -------------------------------------------------------------------------
 # 5. Scalp Position Management (Exit Strategy)
@@ -198,8 +219,8 @@ scalp_management:
 # 6. Global Risk Control (Kill Switch)
 # -------------------------------------------------------------------------
 global:
-  # Max session drawdown allowed
-  max_drawdown_pct: 5.0
+  # Max session drawdown allowed (kill-switch triggers at this threshold)
+  max_drawdown_pct: 10.0
 
   # Max total notional exposure (USD)
   max_total_notional_usd: 5000.0

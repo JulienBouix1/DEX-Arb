@@ -1,13 +1,60 @@
 # -*- coding: utf-8 -*-
 """
-Carry Strategy: Funding Rate Arbitrage between HL and Aster.
+Carry Strategy: Funding Rate Arbitrage between HL, Aster, and Lighter.
 
 Unlike Scalp (entry + instant exit), Carry:
 - Opens delta-neutral positions when funding is favorable
 - Holds for 8h+ to collect funding payments
 - Exits when funding becomes unfavorable or position ages out
 
-Paper mode only for initial testing.
+=============================================================================
+FILE STRUCTURE (2600+ lines)
+=============================================================================
+
+SECTION 1: DATA CLASSES & INITIALIZATION (Lines ~25-260)
+    - CarryPosition dataclass
+    - CarryStrategy.__init__
+    - Configuration loading
+
+SECTION 2: STATE MANAGEMENT (Lines ~260-450)
+    - total_paper_equity, _load_state, _save_state
+    - Entry lock methods (is_entry_in_progress, _register_entry_start, etc.)
+    - Logging methods (_log_opp_audit, _log_mtm, _log)
+    - Blocklist methods (_track_reversal, _is_blocklisted)
+
+SECTION 3: MTM & CALCULATIONS (Lines ~450-650)
+    - _get_total_equity - Fetch equity from venues
+    - _calc_mtm - Mark-to-market calculation
+    - _slip_bps - Slippage estimation
+
+SECTION 4: MAIN LOOP (Lines ~650-850)
+    - tick() - Main strategy loop
+    - _reconcile_state_with_venues - Periodic state sync
+
+SECTION 5: POSITION MANAGEMENT (Lines ~850-1650)
+    - _manage_positions - MTM checks, exit decisions
+    - _yield_rebalance - Optimize yield allocation
+    - _trigger_scale_up - Add to winning positions
+    - _execute_partial_exit - Reduce position size
+    - _execute_exit - Full position exit
+    - _remove_position - Clean up closed position
+    - close_all_positions - Emergency close all
+    - _check_orphans - Detect unhedged positions
+
+SECTION 6: ENTRY LOGIC (Lines ~1650-2370)
+    - _check_entries - Scan for opportunities
+    - _ensure_leverage_setup - Set venue leverage
+    - _execute_smart_entry - Execute dual-leg entry
+    - _cleanup_positions - Handle failed entries
+    - _verify_positions_on_venues_sync - Verify fills
+
+SECTION 7: UTILITIES (Lines ~2370-end)
+    - _calc_pnl - P&L calculation
+    - get_positions_summary - Dashboard data
+    - get_stats - Strategy statistics
+    - get_blocked_pairs - Blocklisted pairs
+
+=============================================================================
 """
 from __future__ import annotations
 
@@ -103,6 +150,7 @@ class CarryStrategy:
         self._pending_exit_force_timeout = 300.0  # Force exit after 5 min of stale data
         self.slip_buffer = float(risk.get("carry", {}).get("slippage_bps_buffer", 2.0))
         self.opt_buffer = float(risk.get("carry", {}).get("optimization_buffer_bps", 10.0))
+        self.rebalance_min_profit_bps = float(risk.get("carry", {}).get("rebalance_min_profit_bps", 10.0))  # Min profit to allow rebalancing
         
         # Scaling (Renforcement)
         self.scale_up_slice_pct = float(risk.get("carry", {}).get("scale_up_slice_pct", 0.10))
@@ -113,11 +161,29 @@ class CarryStrategy:
         # MTM Thresholds (from config or tight defaults)
         self.mtm_stop_bps = -abs(float(risk.get("carry", {}).get("mtm_stop_bps", 35.0)))
         self.mtm_tp_bps = abs(float(risk.get("carry", {}).get("mtm_tp_bps", 25.0)))
-        self.mtm_tp_pct = float(risk.get("carry", {}).get("mtm_tp_pct", 0.02))  # TP at 2% of size_usd
         self.mtm_grace_minutes = float(risk.get("carry", {}).get("mtm_grace_minutes", 15.0))
         self.mtm_yield_multiplier = float(risk.get("carry", {}).get("mtm_yield_multiplier", 2.0))
+        self.mtm_multiplier_window_hours = float(risk.get("carry", {}).get("mtm_multiplier_window_hours", 1.0))  # Multiplier only applies for first N hours
         self.mtm_check_interval = float(risk.get("carry", {}).get("mtm_check_interval_s", 60.0))
-        
+
+        # Tiered Take-Profit System
+        self.high_yield_threshold_bps = float(risk.get("carry", {}).get("high_yield_threshold_bps", 100.0))
+        self.high_yield_tp_pct_initial = float(risk.get("carry", {}).get("high_yield_tp_pct_initial", 0.02))
+        self.high_yield_tp_pct_after_decay = float(risk.get("carry", {}).get("high_yield_tp_pct_after_4h", 0.01))
+        self.high_yield_tp_decay_hours = float(risk.get("carry", {}).get("high_yield_tp_decay_hours", 4.0))
+
+        # Load venue fees from venues.yaml for accurate MTM calculation
+        venues = cfg.get("venues", {})
+        self._venue_fees = {
+            "HL": float(venues.get("hyperliquid", {}).get("fees", {}).get("taker_bps", 4.5)),
+            "AS": float(venues.get("aster", {}).get("fees", {}).get("taker_bps", 4.0)),
+            "LT": float(venues.get("lighter", {}).get("fees", {}).get("taker_bps", 5.0)),
+        }
+        log.info(f"[CARRY] Loaded venue fees: HL={self._venue_fees['HL']}bps, AS={self._venue_fees['AS']}bps, LT={self._venue_fees['LT']}bps")
+
+        # Early Reversal Detection
+        self.early_reversal_min_minutes = float(risk.get("carry", {}).get("early_reversal_min_minutes", 5.0))
+
         # Trailing Stop Parameters
         self.mtm_trailing_bps = float(risk.get("carry", {}).get("mtm_trailing_bps", 150.0))
         self.mtm_trailing_min = float(risk.get("carry", {}).get("mtm_trailing_min_bps", 100.0))
@@ -125,6 +191,11 @@ class CarryStrategy:
         # Leverage Settings (CRITICAL for live trading)
         self.leverage = int(risk.get("carry", {}).get("leverage", 3))
         self._leverage_setup_done: Dict[str, bool] = {}  # Track which symbols have had leverage set
+
+        # Entry Lock: Prevents Position Manager from closing "orphan" positions during multi-leg entry
+        # Maps hl_coin -> timestamp when entry started
+        self._entry_in_progress: Dict[str, float] = {}
+        self._entry_lock_timeout = 30.0  # Grace period in seconds
 
         # Liquidity-Aware Entry (Dynamic Threshold)
         self.min_vol_premium = float(risk.get("carry", {}).get("min_volume_premium_usd", 500000.0))
@@ -136,6 +207,8 @@ class CarryStrategy:
         self._last_funding_check = 0
         self._last_mtm_check = 0
         self._last_heartbeat = 0
+        self._last_reconciliation = 0  # For periodic state sync with venues
+        self._reconciliation_interval = 300.0  # Every 5 minutes
 
         # Auto-blocklist: Track reversals per hl_coin to detect problematic pairs
         # Load from storage to persist across restarts
@@ -231,6 +304,10 @@ class CarryStrategy:
         # Load persisted positions
         self._load_state()
 
+    # =========================================================================
+    # SECTION 2: STATE MANAGEMENT
+    # =========================================================================
+
     @property
     def total_paper_equity(self) -> float:
         """Closed equity + Unrealized MTM of all open positions."""
@@ -289,6 +366,32 @@ class CarryStrategy:
                 blocklist=self._reversal_blocklist,
                 reversal_tracker=self._reversal_tracker
             )
+
+    def is_entry_in_progress(self, hl_coin: str) -> bool:
+        """
+        Check if a multi-leg entry is currently in progress for a symbol.
+        Used by PositionManager to avoid closing 'orphan' positions during entry.
+        """
+        if hl_coin not in self._entry_in_progress:
+            return False
+        entry_start = self._entry_in_progress[hl_coin]
+        elapsed = time.time() - entry_start
+        if elapsed > self._entry_lock_timeout:
+            # Entry took too long - clear stale lock
+            log.warning(f"[CARRY] Clearing stale entry lock for {hl_coin} (elapsed: {elapsed:.1f}s)")
+            self._entry_in_progress.pop(hl_coin, None)
+            return False
+        return True
+
+    def _register_entry_start(self, hl_coin: str) -> None:
+        """Register that a multi-leg entry is starting for a symbol."""
+        self._entry_in_progress[hl_coin] = time.time()
+        log.debug(f"[CARRY] Entry lock acquired: {hl_coin}")
+
+    def _clear_entry_lock(self, hl_coin: str) -> None:
+        """Clear the entry lock after successful entry or rollback."""
+        self._entry_in_progress.pop(hl_coin, None)
+        log.debug(f"[CARRY] Entry lock released: {hl_coin}")
 
     def update_mappings(self, pairs_map: Dict[str, str], lighter_map: Dict[str, str]) -> None:
         """Update symbol mappings dynamically."""
@@ -397,6 +500,10 @@ class CarryStrategy:
             return False
 
         return True
+
+    # =========================================================================
+    # SECTION 3: MTM & CALCULATIONS
+    # =========================================================================
 
     async def _get_total_equity(self) -> float:
         """Fetch total equity across all venues with caching."""
@@ -543,18 +650,34 @@ class CarryStrategy:
         
         funding_pnl_usd = pos.accrued_funding_usd + pending_funding_usd
         
-        # Total MTM
-        total_mtm_usd = price_pnl_usd + funding_pnl_usd
-        
+        # Total MTM (Gross)
+        total_mtm_usd_gross = price_pnl_usd + funding_pnl_usd
+
+        # Net MTM: Subtract REAL fees from venues.yaml based on position's venues
+        # Fee calculation: 2 legs × 2 trades (entry + exit) = 4 taker fees total
+        # But entry fees are sunk cost - only exit fees matter for MTM
+        # Exit = 1 trade per leg = 2 taker fees
+        parts = pos.direction.split(" / ")
+        v1_name = parts[0].split()[-1].upper() if len(parts) >= 1 else "HL"
+        v2_name = parts[1].split()[-1].upper() if len(parts) >= 2 else "AS"
+        fee_v1 = self._venue_fees.get(v1_name, 4.5)
+        fee_v2 = self._venue_fees.get(v2_name, 4.0)
+        # Exit fees = fee_v1 + fee_v2 (one taker trade per leg to close)
+        exit_fee_bps = fee_v1 + fee_v2
+        fee_cost_usd = pos.size_usd * (exit_fee_bps / 10000.0)
+        total_mtm_usd = total_mtm_usd_gross - fee_cost_usd
+
         # Convert to bps
         # Use one-leg notional for bps calculation (matches basis move)
         notional = pos.size_usd
         mtm_bps = (total_mtm_usd / notional * 10000.0) if notional > 0 else 0.0
-        
+
         return {
             "price_pnl_usd": price_pnl_usd,
             "funding_pnl_usd": funding_pnl_usd,
             "total_mtm_usd": total_mtm_usd,
+            "total_mtm_usd_gross": total_mtm_usd_gross,
+            "fee_cost_usd": fee_cost_usd,
             "mtm_bps": mtm_bps,
             "curr_diff_bps": curr_diff
         }
@@ -570,6 +693,10 @@ class CarryStrategy:
         half1 = (ha - hb) / mid1 * 5000.0
         half2 = (aa - ab) / mid2 * 5000.0
         return max(0.0, half1 + half2)
+
+    # =========================================================================
+    # SECTION 4: MAIN LOOP
+    # =========================================================================
 
     async def tick(self) -> None:
         """
@@ -647,6 +774,132 @@ class CarryStrategy:
             self._last_funding_check = now
             if hl_rates and as_rates:
                 await self._check_entries(hl_rates, as_rates, lt_rates)
+
+        # 3. Periodic Reconciliation (every 5 minutes)
+        # Ensures internal state matches actual venue positions
+        if (now - self._last_reconciliation) >= self._reconciliation_interval:
+            self._last_reconciliation = now
+            if self.positions and not self.paper_mode:
+                await self._reconcile_state_with_venues()
+
+    async def _reconcile_state_with_venues(self) -> None:
+        """
+        Periodic reconciliation: Query all venues and verify internal state matches reality.
+        Removes positions from internal state that don't exist on venues.
+        This catches cases where orders failed but internal state was incorrectly updated.
+        """
+        log.info("[CARRY] RECONCILIATION: Checking internal state vs venue positions...")
+
+        try:
+            # Gather all venue positions in parallel
+            tasks = [self.hl.get_positions(), self.asr.get_positions()]
+            if self.lighter:
+                tasks.append(self.lighter.get_positions())
+
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            hl_positions = results[0] if not isinstance(results[0], Exception) else []
+            as_positions = results[1] if not isinstance(results[1], Exception) else []
+            lt_positions = results[2] if len(results) > 2 and not isinstance(results[2], Exception) else []
+
+            # Normalize venue positions into sets of symbols
+            hl_symbols = set()
+            as_symbols = set()
+            lt_symbols = set()
+
+            for pos in (hl_positions or []):
+                sym = pos.get('coin', pos.get('symbol', '')).upper()
+                if sym and abs(float(pos.get('size', 0))) > 0:
+                    hl_symbols.add(sym)
+                    hl_symbols.add(sym + "USDT")
+                    hl_symbols.add(sym.replace("USDT", ""))
+
+            for pos in (as_positions or []):
+                sym = pos.get('symbol', pos.get('coin', '')).upper()
+                if sym and abs(float(pos.get('size', 0))) > 0:
+                    as_symbols.add(sym)
+                    as_symbols.add(sym.replace("USDT", ""))
+
+            for pos in (lt_positions or []):
+                sym = pos.get('symbol', pos.get('coin', '')).upper()
+                if sym and abs(float(pos.get('size', 0))) > 0:
+                    lt_symbols.add(sym)
+                    lt_symbols.add(sym + "USDT")
+                    lt_symbols.add(sym.replace("USDT", ""))
+
+            # Check each internal position
+            positions_to_remove = []
+            for symbol, pos in list(self.positions.items()):
+                hl_coin = pos.hl_coin.upper()
+                direction = pos.direction
+
+                # Determine which venues should have positions
+                # Direction format: "Long HL / Short AS" or "Short AS / Long LT" etc.
+                has_hl = "HL" in direction
+                has_as = "AS" in direction
+                has_lt = "LT" in direction
+
+                # Check if positions exist
+                v1_ok = True
+                v2_ok = True
+
+                if has_hl:
+                    if hl_coin not in hl_symbols and hl_coin + "USDT" not in hl_symbols:
+                        v1_ok = False
+                        log.warning(f"[RECONCILE] {hl_coin}: MISSING on HL (expected from direction: {direction})")
+
+                if has_as:
+                    if hl_coin + "USDT" not in as_symbols and hl_coin not in as_symbols:
+                        v2_ok = False
+                        log.warning(f"[RECONCILE] {hl_coin}: MISSING on AS (expected from direction: {direction})")
+
+                if has_lt:
+                    if hl_coin not in lt_symbols and hl_coin + "USDT" not in lt_symbols:
+                        if has_hl:
+                            v2_ok = False
+                        else:
+                            v1_ok = False
+                        log.warning(f"[RECONCILE] {hl_coin}: MISSING on LT (expected from direction: {direction})")
+
+                if not v1_ok and not v2_ok:
+                    log.error(f"[RECONCILE] {hl_coin}: BOTH LEGS MISSING! Removing from internal state.")
+                    positions_to_remove.append(symbol)
+                    if self.notifier:
+                        await self.notifier.notify(
+                            f"RECONCILE: {hl_coin}",
+                            f"Both legs MISSING on venues! Removing from tracking. "
+                            f"Internal had: ${pos.size_usd:.2f}, scale_up={pos.scale_up_count}"
+                        )
+                elif not v1_ok or not v2_ok:
+                    log.error(f"[RECONCILE] {hl_coin}: ONE LEG MISSING! UNHEDGED RISK - keeping in state for manual review.")
+                    if self.notifier:
+                        await self.notifier.notify(
+                            f"RECONCILE ALERT: {hl_coin}",
+                            f"ONE LEG MISSING - UNHEDGED! Direction: {direction}. "
+                            f"HL: {has_hl and v1_ok}, AS: {has_as and v2_ok}, LT: {has_lt and (v2_ok if has_hl else v1_ok)}. "
+                            f"Manual intervention required!"
+                        )
+                else:
+                    log.debug(f"[RECONCILE] {hl_coin}: OK - both legs confirmed on venues")
+
+            # Remove positions that don't exist on venues
+            if positions_to_remove:
+                log.warning(f"[RECONCILE] Removing {len(positions_to_remove)} stale positions: {positions_to_remove}")
+                for sym in positions_to_remove:
+                    del self.positions[sym]
+                self._save_state()
+
+            log.info(f"[CARRY] RECONCILIATION COMPLETE: {len(self.positions)} positions tracked, "
+                    f"HL has {len(hl_symbols)} symbols, AS has {len(as_symbols)} symbols, LT has {len(lt_symbols)} symbols")
+
+        except Exception as e:
+            log.error(f"[CARRY] Reconciliation error: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # =========================================================================
+    # SECTION 5: POSITION MANAGEMENT
+    # =========================================================================
 
     async def _manage_positions(self, hl_rates: Dict, as_rates: Dict, lt_rates: Dict) -> None:
         """
@@ -727,9 +980,16 @@ class CarryStrategy:
             # We use the MAX of live yield and entry yield as our stability anchor
             curr_y = abs(mtm.get("curr_diff_bps", 0.0))
             anchor_yield = max(curr_y, abs(pos.entry_diff_bps))
-            
+
             # Dynamic Stop = Base Floor (Negative) - (Anchor Yield * Multiplier)
-            base_stop_floor = -self.mtm_stop_bps - (anchor_yield * self.mtm_yield_multiplier)
+            # BUT: Multiplier only applies during the first N hours after entry (volatility window)
+            # After that, hard stop at mtm_stop_bps applies to prevent runaway losses
+            if hold_hours <= self.mtm_multiplier_window_hours:
+                # Early period: allow wider stop based on yield
+                base_stop_floor = -self.mtm_stop_bps - (anchor_yield * self.mtm_yield_multiplier)
+            else:
+                # After multiplier window: hard stop only
+                base_stop_floor = -self.mtm_stop_bps
             
             # Trailing Profit Protection
             trailing_floor = -9999.0
@@ -747,13 +1007,32 @@ class CarryStrategy:
                 to_close.append((sym, f"{stop_type}({current_mtm_bps:.1f} < {exit_floor:.1f}bps)", mtm["price_pnl_usd"], mtm["funding_pnl_usd"]))
                 continue
 
-            # Take Profit: % of size_usd (NEW - primary TP trigger)
-            tp_usd_threshold = pos.size_usd * self.mtm_tp_pct
-            if mtm["total_mtm_usd"] >= tp_usd_threshold:
-                to_close.append((sym, f"mtm_tp_pct(${mtm['total_mtm_usd']:.2f}>=${tp_usd_threshold:.2f})", mtm["price_pnl_usd"], mtm["funding_pnl_usd"]))
-                continue
-            # Take Profit: Fixed bps (fallback for windfall scenarios)
-            elif current_mtm_bps > self.mtm_tp_bps:
+            # TIERED TAKE-PROFIT SYSTEM (configurable via risk.yaml)
+            # High-yield pairs (≥high_yield_threshold_bps): % TP with time decay
+            # Low-yield pairs: TP when MTM ≥ entry rate (net of fees)
+            is_high_yield = abs(pos.entry_diff_bps) >= self.high_yield_threshold_bps
+
+            if is_high_yield:
+                # High-yield: Use % of size_usd, with time decay
+                if hold_hours >= self.high_yield_tp_decay_hours:
+                    tp_pct = self.high_yield_tp_pct_after_decay
+                else:
+                    tp_pct = self.high_yield_tp_pct_initial
+                tp_usd_threshold = pos.size_usd * tp_pct
+                if mtm["total_mtm_usd"] >= tp_usd_threshold:
+                    tp_label = f"high_yield_tp_{int(tp_pct*100)}pct"
+                    to_close.append((sym, f"{tp_label}(${mtm['total_mtm_usd']:.2f}>=${tp_usd_threshold:.2f})", mtm["price_pnl_usd"], mtm["funding_pnl_usd"]))
+                    continue
+            else:
+                # Low-yield: TP when MTM (already net of fees) exceeds entry rate
+                # Since MTM is now net of fees, compare directly to entry_diff_bps
+                entry_rate = abs(pos.entry_diff_bps)
+                if current_mtm_bps > 0 and current_mtm_bps >= entry_rate:
+                    to_close.append((sym, f"low_yield_tp({current_mtm_bps:.1f}>={entry_rate:.1f}bps)", mtm["price_pnl_usd"], mtm["funding_pnl_usd"]))
+                    continue
+
+            # Fallback: Fixed bps TP for windfall scenarios (applies to both tiers)
+            if current_mtm_bps > self.mtm_tp_bps:
                 to_close.append((sym, f"mtm_tp_bps({current_mtm_bps:.1f}bps)", mtm["price_pnl_usd"], mtm["funding_pnl_usd"]))
                 continue
 
@@ -781,8 +1060,7 @@ class CarryStrategy:
 
                 # EARLY REVERSAL: If funding has completely flipped (sign change), exit
                 # This protects against paying funding instead of collecting it
-                # BUG FIX: Added minimum hold time (10 min) to avoid exiting on noise
-                early_reversal_min_hold_hours = 10.0 / 60.0  # 10 minutes
+                early_reversal_min_hold_hours = self.early_reversal_min_minutes / 60.0
                 entry_sign = 1 if pos.entry_diff_bps > 0 else -1
                 current_sign = 1 if curr_diff_bps > 0 else -1
                 if entry_sign != current_sign and abs(curr_diff_bps) > 5.0 and hold_hours >= early_reversal_min_hold_hours:
@@ -903,10 +1181,13 @@ class CarryStrategy:
             pos_data = []
             for sym, pos in self.positions.items():
                 mtm = self._calc_mtm(pos)
-                # Use accrued_funding as fallback for profitability if MTM calc returns 0
-                # (happens when BBO unavailable)
+                # CRITICAL FIX: Only consider profitable if TOTAL PnL (price + funding) > 0
+                # Previously was allowing scale-down when funding > 0 but price was negative
                 total_pnl = mtm["total_mtm_usd"]
-                is_profitable = total_pnl > 0 or pos.accrued_funding_usd > 0.01  # Any meaningful accrued funding
+                # If MTM calc returns 0 (BBO unavailable), use accrued funding as estimate
+                if total_pnl == 0 and pos.accrued_funding_usd > 0:
+                    total_pnl = pos.accrued_funding_usd
+                is_profitable = total_pnl > 0
                 pos_data.append({
                     "sym": sym,
                     "pos": pos,
@@ -916,7 +1197,7 @@ class CarryStrategy:
                     "total_pnl": total_pnl,
                     "in_profit": is_profitable
                 })
-                log.debug(f"[CARRY] REBAL CHECK {pos.hl_coin}: yield={abs(pos.entry_diff_bps):.1f}bps, scale={pos.scale_up_count}, "
+                log.info(f"[CARRY] REBAL CHECK {pos.hl_coin}: yield={abs(pos.entry_diff_bps):.1f}bps, scale={pos.scale_up_count}, "
                          f"mtm=${total_pnl:.2f}, accrued=${pos.accrued_funding_usd:.2f}, in_profit={is_profitable}")
 
             # Sort by yield (highest first)
@@ -937,6 +1218,10 @@ class CarryStrategy:
                         continue  # Not oversized (never scaled up)
                     if not low_yield["in_profit"]:
                         continue  # Only scale down if in profit
+                    # Minimum profit threshold: don't rebalance if profit is too small
+                    min_profit_usd = low_yield["size_usd"] * (self.rebalance_min_profit_bps / 10000.0)
+                    if low_yield["total_pnl"] < min_profit_usd:
+                        continue  # Profit too small to justify rebalancing
                     # Check if high_yield is significantly better than low_yield
                     # Rebalance if: high_yield > low_yield + buffer (meaningful improvement)
                     if high_yield["yield_bps"] <= low_yield["yield_bps"] + self.opt_buffer:
@@ -1286,6 +1571,55 @@ class CarryStrategy:
             del self.positions[sym]
             self._save_state()
 
+    async def close_all_positions(self, reason: str = "DASHBOARD_CLOSE_ALL") -> dict:
+        """
+        Close all open carry positions. Called from dashboard buttons.
+        Returns dict with list of closed positions and any errors.
+        """
+        log.warning(f"[CARRY] CLOSE ALL POSITIONS triggered: {reason}")
+        result = {"closed": [], "errors": [], "total_pnl": 0.0}
+
+        if not self.positions:
+            log.info("[CARRY] No positions to close")
+            return result
+
+        # Copy keys to avoid dict modification during iteration
+        syms_to_close = list(self.positions.keys())
+
+        for sym in syms_to_close:
+            pos = self.positions.get(sym)
+            if not pos:
+                continue
+
+            try:
+                mtm = self._calc_mtm(pos)
+                pnl_price = mtm.get("price_pnl_usd", 0.0)
+                pnl_funding = mtm.get("funding_pnl_usd", 0.0)
+                total_pnl = mtm.get("total_mtm_usd", 0.0)
+
+                success = await self._execute_exit(sym, reason, pnl_price, pnl_funding)
+
+                if success:
+                    result["closed"].append({
+                        "symbol": sym,
+                        "coin": pos.hl_coin,
+                        "direction": pos.direction,
+                        "size_usd": pos.size_usd,
+                        "pnl_usd": total_pnl
+                    })
+                    result["total_pnl"] += total_pnl
+                    log.info(f"[CARRY] Closed {sym}: PnL=${total_pnl:.2f}")
+                else:
+                    result["errors"].append({"symbol": sym, "error": "Exit failed"})
+                    log.error(f"[CARRY] Failed to close {sym}")
+
+            except Exception as e:
+                log.error(f"[CARRY] Exception closing {sym}: {e}")
+                result["errors"].append({"symbol": sym, "error": str(e)})
+
+        log.warning(f"[CARRY] CLOSE ALL complete: {len(result['closed'])} closed, {len(result['errors'])} errors, Total PnL=${result['total_pnl']:.2f}")
+        return result
+
     async def _check_orphans(self) -> None:
         """
         Phase 4.1: Detect orphan positions (size_usd=0) and attempt recovery.
@@ -1375,8 +1709,12 @@ class CarryStrategy:
         try:
             total_exp = sum(p.size_usd for p in self.positions.values())
             log.info(f"[HEARTBEAT] Positions: {len(self.positions)} | Exp: ${total_exp:.0f} | Equity: ${self._cached_total_equity:.0f}")
-        except Exception: 
+        except Exception:
             pass
+
+    # =========================================================================
+    # SECTION 6: ENTRY LOGIC
+    # =========================================================================
 
     async def _check_entries(self, hl_rates: Dict[str, float], as_rates: Dict[str, float], lt_rates: Dict[str, float] = None) -> None:
         """Look for new carry opportunities with fee accounting."""
@@ -1436,8 +1774,31 @@ class CarryStrategy:
                     v_map = {"HL": self.hl, "AS": self.asr, "LT": self.lighter}
                     b1 = v_map[v1_n].get_bbo(s1)
                     b2 = v_map[v2_n].get_bbo(s2)
-                    
+
                     if not b1 or not b2 or (b1[0]+b1[1])<=0 or (b2[0]+b2[1])<=0: continue
+
+                    # STALENESS CHECK: Skip entries if BBO data is too old (prevents trading on stale prices)
+                    # Use permissive threshold - we have valid BBO data, just checking freshness
+                    MAX_ENTRY_BBO_AGE_MS = 30000.0  # 30 seconds - permissive for carry (not HFT)
+                    is_stale = False
+                    v1_obj = v_map[v1_n]
+                    v2_obj = v_map[v2_n]
+                    # Only check staleness if method exists AND returns a reasonable value
+                    # (999999 means no timestamp was set, likely REST fallback - don't block)
+                    if hasattr(v1_obj, 'get_bbo_age_ms'):
+                        age1 = v1_obj.get_bbo_age_ms(s1)
+                        if 0 < age1 < 100000 and age1 > MAX_ENTRY_BBO_AGE_MS:
+                            is_stale = True
+                            log.debug(f"[CARRY] V1 {v1_n} {s1} BBO age: {age1:.0f}ms (stale)")
+                    if hasattr(v2_obj, 'get_bbo_age_ms') and not is_stale:
+                        age2 = v2_obj.get_bbo_age_ms(s2)
+                        if 0 < age2 < 100000 and age2 > MAX_ENTRY_BBO_AGE_MS:
+                            is_stale = True
+                            log.debug(f"[CARRY] V2 {v2_n} {s2} BBO age: {age2:.0f}ms (stale)")
+                    if is_stale:
+                        self._log_opp_audit(hl_coin, abs_diff_bps, "STALE_DATA",
+                                          "BBO data too old for entry", f"{v1_n}/{v2_n}")
+                        continue
                     
                     slip = self._slip_bps(b1, b2)
                     net_yield = abs_diff_bps - (slip + self.slip_buffer + EST_FEES_BPS)
@@ -1672,6 +2033,34 @@ class CarryStrategy:
                 log.warning(f"[CARRY] HARD BLOCK SCALE-UP {hl_coin}: already at max ({existing_pos.scale_up_count}/{self.max_scale_ups_per_position})")
                 return
 
+            # SCALE-UP PROTECTION: Verify both legs exist on venues before adding more size
+            # This prevents accumulating unhedged risk if one leg was orphan-closed
+            if not self.paper_mode:
+                try:
+                    v1_positions = await v1_obj.get_positions() or []
+                    v2_positions = await v2_obj.get_positions() or []
+                    v1_found = any(
+                        pos.get('symbol', '').upper() in (hl_coin.upper(), s1.upper())
+                        for pos in v1_positions
+                        if abs(float(pos.get('size', 0))) > 0
+                    )
+                    v2_found = any(
+                        pos.get('symbol', '').upper() in (hl_coin.upper(), s2.upper())
+                        for pos in v2_positions
+                        if abs(float(pos.get('size', 0))) > 0
+                    )
+                    if not v1_found or not v2_found:
+                        log.error(f"[CARRY] SCALE-UP BLOCKED {hl_coin}: Missing leg! V1({v1_n})={v1_found}, V2({v2_n})={v2_found}. Position may be unhedged!")
+                        if self.notifier:
+                            await self.notifier.notify(
+                                f"SCALE-UP BLOCKED: {hl_coin}",
+                                f"V1({v1_n})={v1_found}, V2({v2_n})={v2_found}. Position may be UNHEDGED!"
+                            )
+                        return
+                    log.debug(f"[CARRY] SCALE-UP VERIFIED {hl_coin}: Both legs confirmed on venues")
+                except Exception as e:
+                    log.warning(f"[CARRY] SCALE-UP position check failed for {hl_coin}: {e}. Proceeding cautiously...")
+
             # ABSOLUTE BLOCK: Check size-based limit (3 entries = 3x slice_size)
             # max_size = equity * max_carry_alloc_pct * alloc_pct * 3 (initial + 2 scale-ups)
             max_expected_size = total_equity * self.max_carry_alloc_pct * self.alloc_pct * 3.0
@@ -1727,6 +2116,19 @@ class CarryStrategy:
             # Use realistic prices (bid for sell, ask for buy) instead of optimistic mid
             prices["v1"] = (b1[1] if side1 == "BUY" else b1[0]) if b1 else 100
             prices["v2"] = (b2[1] if side2 == "BUY" else b2[0]) if b2 else 100
+
+            # --- 0 bps Favorable Entry Check (paper mode) ---
+            if b1 and b2:
+                entry_slip = self._slip_bps(b1, b2)
+                entry_raw_diff = abs((r1 - r2) * 10000.0)
+                entry_net_yield = entry_raw_diff - (entry_slip + self.slip_buffer + EST_FEES_BPS)
+                if entry_net_yield < diff_bps:
+                    log.info(f"[CARRY] {action_name} SKIPPED {hl_coin}: basis narrowed "
+                            f"entry={entry_net_yield:.1f}bps < detection={diff_bps:.1f}bps")
+                    self._log_opp_audit(target_sym, diff_bps, "SKIPPED", "Adverse Entry Basis",
+                                       f"entry={entry_net_yield:.1f} det={diff_bps:.1f}")
+                    return
+
         elif self.dry_run_live:
             # DRY-RUN LIVE: Calculate everything but don't place orders
             # Use get_fresh_bbo for Lighter (has REST fallback if WS stale)
@@ -1755,6 +2157,21 @@ class CarryStrategy:
                 # Realistic prices - size_per_leg = size_usd / 2 (half per venue)
                 p1 = bbo1[1] if side1 == "BUY" else bbo1[0]
                 p2 = bbo2[1] if side2 == "BUY" else bbo2[0]
+
+                # --- 0 bps Favorable Entry Check ---
+                # Recalculate entry-time basis using fresh BBOs
+                entry_slip = self._slip_bps(bbo1, bbo2)
+                entry_raw_diff = abs((r1 - r2) * 10000.0)
+                entry_net_yield = entry_raw_diff - (entry_slip + self.slip_buffer + EST_FEES_BPS)
+
+                # Skip if entry basis < detection basis (spread narrowed)
+                if entry_net_yield < diff_bps:
+                    log.info(f"[CARRY] {action_name} SKIPPED {hl_coin}: basis narrowed "
+                            f"entry={entry_net_yield:.1f}bps < detection={diff_bps:.1f}bps")
+                    self._log_opp_audit(target_sym, diff_bps, "SKIPPED", "Adverse Entry Basis",
+                                       f"entry={entry_net_yield:.1f} det={diff_bps:.1f}")
+                    return
+
             size_per_leg = size_usd / 2
             qty1 = v1_obj.round_qty(s1, size_per_leg / p1)
             qty2 = v2_obj.round_qty(s2, size_per_leg / p2)
@@ -1792,6 +2209,9 @@ class CarryStrategy:
             size_per_leg = size_usd / 2  # Half per venue
             qty1 = v1_obj.round_qty(s1, size_per_leg/ft1_px)
 
+            # ENTRY LOCK: Prevent Position Manager from closing "orphan" during multi-leg entry
+            self._register_entry_start(hl_coin)
+
             # Leg 1 Entry with retry (2 attempts)
             f1 = 0.0
             p1 = 0.0
@@ -1811,6 +2231,7 @@ class CarryStrategy:
 
             if f1 <= 0:
                 log.warning(f"[CARRY] Entry/Scale Leg 1 failed for {hl_coin} after 2 attempts")
+                self._clear_entry_lock(hl_coin)
                 return
 
             prices["v1"] = p1
@@ -1835,25 +2256,132 @@ class CarryStrategy:
                 await asyncio.sleep(0.5)
 
             if f2 <= 0:
-                # ATOMIC ROLLBACK
-                log.error(f"[CARRY] CRITICAL: Leg 2 {s2} failed after 2 attempts. ROLLING BACK Leg 1.")
-                inv_side = "SELL" if side1 == "BUY" else "BUY"
-                # CRITICAL: Aster doesn't support reduce_only=True
-                use_reduce_only_rb = v1_n != "AS"
-                for rb_attempt in range(3):
+                # V2 RETRY RECOVERY LOGIC (FIX 2026-01-09)
+                # Instead of immediate rollback, check if edge still profitable and retry V2
+                V2_RETRY_MAX = int(self.risk.get("carry", {}).get("v2_retry_max_attempts", 3))
+                V2_RETRY_WINDOW = float(self.risk.get("carry", {}).get("v2_retry_window_sec", 10.0))
+                V2_EDGE_THRESHOLD = float(self.risk.get("carry", {}).get("v2_edge_decay_threshold", 0.80))
+                EST_FEES_BPS = 15.0
+
+                log.warning(f"[CARRY] V2 {s2} failed initial 2 attempts. Starting edge-aware retry "
+                           f"(orig_edge={diff_bps:.1f}bps, max_retries={V2_RETRY_MAX}, window={V2_RETRY_WINDOW}s)")
+
+                retry_start = time.time()
+                v2_retry_success = False
+
+                for v2_retry in range(V2_RETRY_MAX):
+                    elapsed = time.time() - retry_start
+                    if elapsed > V2_RETRY_WINDOW:
+                        log.warning(f"[CARRY] V2 retry window exhausted ({elapsed:.1f}s > {V2_RETRY_WINDOW}s)")
+                        break
+
+                    # Fetch fresh BBO for V2
+                    if v2_n == "LT" and hasattr(v2_obj, 'get_fresh_bbo'):
+                        fresh_bbo2 = await v2_obj.get_fresh_bbo(s2)
+                    else:
+                        fresh_bbo2 = v2_obj.get_bbo(s2)
+
+                    if not fresh_bbo2 or (fresh_bbo2[0] + fresh_bbo2[1]) <= 0:
+                        log.warning(f"[CARRY] V2 retry #{v2_retry+1}: No valid BBO for {s2}")
+                        await asyncio.sleep(1.5)
+                        continue
+
+                    # Recalculate edge with fresh BBO
+                    # slip = half-spread on each side (simplified)
+                    slip1 = ((bbo1[1] - bbo1[0]) / ((bbo1[0] + bbo1[1]) / 2)) * 5000.0 if bbo1 and bbo1[0] > 0 else 5.0
+                    slip2 = ((fresh_bbo2[1] - fresh_bbo2[0]) / ((fresh_bbo2[0] + fresh_bbo2[1]) / 2)) * 5000.0 if fresh_bbo2[0] > 0 else 5.0
+                    retry_slip = slip1 + slip2
+                    retry_raw_diff = abs((r1 - r2) * 10000.0)
+                    retry_net_yield = retry_raw_diff - (retry_slip + self.slip_buffer + EST_FEES_BPS)
+
+                    min_required_edge = diff_bps * V2_EDGE_THRESHOLD
+                    log.info(f"[CARRY] V2 retry #{v2_retry+1}: edge={retry_net_yield:.1f}bps "
+                            f"(min={min_required_edge:.1f}bps, orig={diff_bps:.1f}bps)")
+
+                    if retry_net_yield < min_required_edge:
+                        log.warning(f"[CARRY] V2 retry #{v2_retry+1}: Edge degraded below threshold "
+                                   f"({retry_net_yield:.1f} < {min_required_edge:.1f}bps). Aborting retries.")
+                        break
+
+                    # Retry V2 order with fresh price
+                    fresh_p2 = fresh_bbo2[1] if side2 == "BUY" else fresh_bbo2[0]
+                    retry_qty2 = v2_obj.round_qty(s2, f1)  # Match V1 filled qty
+
                     try:
-                        rb_res = await v1_obj.place_order(s1, inv_side, v1_obj.round_qty(s1, f1), ioc=True, reduce_only=use_reduce_only_rb)
-                        if float(rb_res.get("filled", 0.0)) > 0:
-                            log.info(f"[CARRY] Rollback successful")
+                        res2 = await v2_obj.place_order(s2, side2, retry_qty2, ioc=True)
+                        f2 = float(res2.get("filled", 0.0))
+                        if f2 > 0:
+                            p2 = float(res2.get("avg_price", 0.0))
+                            if p2 <= 0:
+                                p2 = fresh_p2
+                            log.info(f"[CARRY] V2 RETRY SUCCESS #{v2_retry+1}: "
+                                    f"Filled {f2:.6f} @ ${p2:.4f} (edge={retry_net_yield:.1f}bps)")
+                            v2_retry_success = True
                             break
                     except Exception as e:
-                        log.error(f"[CARRY] Rollback attempt {rb_attempt+1} failed: {e}")
-                    await asyncio.sleep(1.0)
-                return  # Abort Entry
+                        log.warning(f"[CARRY] V2 retry #{v2_retry+1} exception: {e}")
+
+                    # Backoff delay between retries
+                    retry_delay = 1.5 + (v2_retry * 0.5)
+                    await asyncio.sleep(retry_delay)
+
+                # If all retries failed, execute rollback
+                if not v2_retry_success:
+                    log.error(f"[CARRY] CRITICAL: V2 {s2} failed after {V2_RETRY_MAX} additional retries. ROLLING BACK Leg 1.")
+                    inv_side = "SELL" if side1 == "BUY" else "BUY"
+                    # CRITICAL: Aster doesn't support reduce_only=True
+                    use_reduce_only_rb = v1_n != "AS"
+                    for rb_attempt in range(3):
+                        try:
+                            rb_res = await v1_obj.place_order(s1, inv_side, v1_obj.round_qty(s1, f1), ioc=True, reduce_only=use_reduce_only_rb)
+                            if float(rb_res.get("filled", 0.0)) > 0:
+                                log.info(f"[CARRY] Rollback successful after V2 retry exhaustion")
+                                break
+                        except Exception as e:
+                            log.error(f"[CARRY] Rollback attempt {rb_attempt+1} failed: {e}")
+                        await asyncio.sleep(1.0)
+                    self._clear_entry_lock(hl_coin)
+                    return  # Abort Entry
 
             prices["v2"] = p2
 
-        # Update or Create Position
+            # CRITICAL FIX: Verify positions exist on venues BEFORE updating internal state
+            # This prevents hallucinated positions (like AVNT scale_up_count=2 when no scale happened)
+            v1_confirmed, v2_confirmed = await self._verify_positions_on_venues_sync(
+                hl_coin, v1_n, v2_n, target_sym, s1, s2
+            )
+
+            if not v1_confirmed or not v2_confirmed:
+                log.error(f"[CARRY] ENTRY ABORTED: Position verification failed for {hl_coin}")
+                log.error(f"  V1 ({v1_n}): {'CONFIRMED' if v1_confirmed else 'MISSING'}")
+                log.error(f"  V2 ({v2_n}): {'CONFIRMED' if v2_confirmed else 'MISSING'}")
+
+                # If one leg exists but not the other, we have an orphan - need manual intervention
+                if v1_confirmed and not v2_confirmed:
+                    log.error(f"[CARRY] UNHEDGED: Position on {v1_n} but NOT on {v2_n}! Manual close may be required.")
+                    if self.notifier:
+                        await self.notifier.notify(
+                            f"ENTRY FAILED: {hl_coin}",
+                            f"UNHEDGED! Found on {v1_n}, MISSING on {v2_n}. Manual intervention required!"
+                        )
+                elif v2_confirmed and not v1_confirmed:
+                    log.error(f"[CARRY] UNHEDGED: Position on {v2_n} but NOT on {v1_n}! Manual close may be required.")
+                    if self.notifier:
+                        await self.notifier.notify(
+                            f"ENTRY FAILED: {hl_coin}",
+                            f"UNHEDGED! Found on {v2_n}, MISSING on {v1_n}. Manual intervention required!"
+                        )
+                else:
+                    log.error(f"[CARRY] Both legs missing on venues - order may have been rejected")
+
+                # DO NOT update internal state - positions don't exist
+                self._clear_entry_lock(hl_coin)
+                return
+
+            # ENTRY LOCK RELEASE: Both legs completed and verified successfully
+            self._clear_entry_lock(hl_coin)
+
+        # Update or Create Position (ONLY if live verification passed or in paper/dry-run mode)
         if existing_pos:
             old_size = existing_pos.size_usd
             new_size = size_usd
@@ -1894,12 +2422,225 @@ class CarryStrategy:
         self._log(target_sym, action_name, direction, size_usd, r1, r2, v1_n, v2_n,
                   equity=(self.total_paper_equity if self.paper_mode else total_equity))
 
+        # NOTE: Position verification now happens BEFORE state update (see above)
+        # Old async fire-and-forget verification removed - was unreliable
+
     def _cleanup_positions(self, symbols: List[str]):
         """Remove positions from the active tracking."""
         for sym in symbols:
             if sym in self.positions:
                 del self.positions[sym]
         self._save_state()
+
+    async def _verify_positions_on_venues_sync(
+        self, hl_coin: str, v1_name: str, v2_name: str, symbol: str, s1: str, s2: str
+    ) -> Tuple[bool, bool]:
+        """
+        SYNCHRONOUS position verification: Query venues and confirm positions exist.
+        Called BEFORE updating internal state to prevent hallucinated positions.
+
+        Returns: (v1_confirmed, v2_confirmed) - tuple of bools indicating if each leg exists
+
+        FIX 2026-01-09: Added retry logic with longer initial wait for Lighter position propagation.
+        Lighter positions can take 2-3 seconds to appear in the account API after order fill.
+        """
+        VERIFY_MAX_ATTEMPTS = 3
+        VERIFY_INITIAL_WAIT = 2.0  # Increased from 1.0s
+        VERIFY_RETRY_WAIT = 1.5
+
+        await asyncio.sleep(VERIFY_INITIAL_WAIT)  # Allow order propagation time
+
+        try:
+            # Get venue objects
+            v1_obj = self.hl if v1_name == "HL" else (self.asr if v1_name == "AS" else self.lighter)
+            v2_obj = self.hl if v2_name == "HL" else (self.asr if v2_name == "AS" else self.lighter)
+
+            if not v1_obj or not v2_obj:
+                log.warning(f"[CARRY] Position verification skipped - venue unavailable")
+                # Return True to allow entry (fallback to old behavior if venues unavailable)
+                return True, True
+
+            # Symbol normalization for matching - expanded to cover more formats
+            base_coin = hl_coin.upper().replace("USDT", "").replace("USDC", "").replace("-PERP", "")
+            search_symbols = {
+                hl_coin.upper(),
+                symbol.upper(),
+                s1.upper(),
+                base_coin,
+                base_coin + "USDT",
+                base_coin + "USDC",
+                base_coin + "/USDC",
+                base_coin + "-PERP",
+            }
+            search_symbols_v2 = {
+                hl_coin.upper(),
+                symbol.upper(),
+                s2.upper(),
+                base_coin,
+                base_coin + "USDT",
+                base_coin + "USDC",
+                base_coin + "/USDC",
+                base_coin + "-PERP",
+            }
+
+            v1_found = False
+            v2_found = False
+            v1_size = 0.0
+            v2_size = 0.0
+
+            for attempt in range(VERIFY_MAX_ATTEMPTS):
+                # Fetch positions from both venues in parallel
+                try:
+                    v1_positions, v2_positions = await asyncio.gather(
+                        v1_obj.get_positions(),
+                        v2_obj.get_positions(),
+                        return_exceptions=True
+                    )
+                except Exception as e:
+                    log.error(f"[CARRY] Error fetching positions for verification: {e}")
+                    # Return True to allow entry (don't block on verification errors)
+                    return True, True
+
+                # Handle exceptions from gather
+                if isinstance(v1_positions, Exception):
+                    log.warning(f"[CARRY] V1 position fetch failed: {v1_positions}")
+                    v1_positions = []
+                if isinstance(v2_positions, Exception):
+                    log.warning(f"[CARRY] V2 position fetch failed: {v2_positions}")
+                    v2_positions = []
+
+                v1_positions = v1_positions or []
+                v2_positions = v2_positions or []
+
+                # Log received positions on first attempt for debugging
+                if attempt == 0:
+                    v1_syms = [p.get('symbol', p.get('coin', '?')) for p in v1_positions]
+                    v2_syms = [p.get('symbol', p.get('coin', '?')) for p in v2_positions]
+                    log.info(f"[CARRY] VERIFY {hl_coin}: V1({v1_name}) has {len(v1_positions)} positions: {v1_syms}")
+                    log.info(f"[CARRY] VERIFY {hl_coin}: V2({v2_name}) has {len(v2_positions)} positions: {v2_syms}")
+                    log.info(f"[CARRY] VERIFY {hl_coin}: Searching for: {search_symbols_v2}")
+
+                # Find V1 position
+                if not v1_found:
+                    for pos in v1_positions:
+                        pos_symbol = pos.get('symbol', '').upper()
+                        pos_coin = pos.get('coin', '').upper()
+                        if pos_symbol in search_symbols or pos_coin in search_symbols or pos_coin == base_coin:
+                            v1_found = True
+                            v1_size = abs(float(pos.get('size', 0)))
+                            log.info(f"[CARRY] V1 {v1_name}: Found position for {pos_symbol}/{pos_coin} size={v1_size:.6f}")
+                            break
+
+                # Find V2 position
+                if not v2_found:
+                    for pos in v2_positions:
+                        pos_symbol = pos.get('symbol', '').upper()
+                        pos_coin = pos.get('coin', '').upper()
+                        if pos_symbol in search_symbols_v2 or pos_coin in search_symbols_v2 or pos_coin == base_coin:
+                            v2_found = True
+                            v2_size = abs(float(pos.get('size', 0)))
+                            log.info(f"[CARRY] V2 {v2_name}: Found position for {pos_symbol}/{pos_coin} size={v2_size:.6f}")
+                            break
+
+                if v1_found and v2_found:
+                    log.info(f"[CARRY] VERIFY OK: {hl_coin} confirmed on both venues "
+                            f"({v1_name}={v1_size:.6f}, {v2_name}={v2_size:.6f}) after {attempt+1} attempt(s)")
+                    return True, True
+
+                # If not both found and we have more attempts, wait and retry
+                if attempt < VERIFY_MAX_ATTEMPTS - 1:
+                    log.info(f"[CARRY] VERIFY attempt {attempt+1}/{VERIFY_MAX_ATTEMPTS}: "
+                            f"V1={v1_found} V2={v2_found}, retrying in {VERIFY_RETRY_WAIT}s...")
+                    await asyncio.sleep(VERIFY_RETRY_WAIT)
+
+            # Final result after all attempts
+            log.warning(f"[CARRY] VERIFY INCOMPLETE after {VERIFY_MAX_ATTEMPTS} attempts: "
+                       f"{hl_coin} V1({v1_name})={v1_found} V2({v2_name})={v2_found}")
+            return v1_found, v2_found
+
+        except Exception as e:
+            log.error(f"[CARRY] Position verification exception: {e}")
+            import traceback
+            traceback.print_exc()
+            # Return True to allow entry (don't block on verification errors)
+            return True, True
+
+    async def _verify_position_against_venues(self, hl_coin: str, v1_name: str, v2_name: str, symbol: str):
+        """
+        Async verification: Query venues and confirm position exists after entry.
+        Log warning if positions don't match expected state.
+        """
+        await asyncio.sleep(2.0)  # Allow order propagation time
+
+        try:
+            # Get venue objects
+            v1_obj = self.hl if v1_name == "HL" else (self.asr if v1_name == "AS" else self.lighter)
+            v2_obj = self.hl if v2_name == "HL" else (self.asr if v2_name == "AS" else self.lighter)
+
+            if not v1_obj or not v2_obj:
+                log.warning(f"[CARRY] Position verification skipped - venue unavailable for {symbol}")
+                return
+
+            # Fetch positions from both venues
+            v1_positions = await v1_obj.get_positions() or []
+            v2_positions = await v2_obj.get_positions() or []
+
+            # Find our positions
+            v1_found = False
+            v2_found = False
+            v1_size = 0.0
+            v2_size = 0.0
+
+            for pos in v1_positions:
+                pos_symbol = pos.get('symbol', '').upper()
+                if pos_symbol == hl_coin.upper() or pos_symbol == symbol.upper():
+                    v1_found = True
+                    v1_size = abs(float(pos.get('size', 0)))
+                    break
+
+            for pos in v2_positions:
+                pos_symbol = pos.get('symbol', '').upper()
+                if pos_symbol == hl_coin.upper() or pos_symbol == symbol.upper():
+                    v2_found = True
+                    v2_size = abs(float(pos.get('size', 0)))
+                    break
+
+            # Check if internal state matches venue state
+            internal_pos = self.positions.get(symbol)
+            if not internal_pos:
+                log.warning(f"[CARRY] VERIFY: No internal position for {symbol} - may have been exited")
+                return
+
+            if v1_found and v2_found:
+                log.info(f"[CARRY] VERIFY OK: {symbol} confirmed on both venues (V1={v1_size:.4f}, V2={v2_size:.4f})")
+            elif v1_found and not v2_found:
+                log.error(f"[CARRY] POSITION MISMATCH: {symbol} exists on {v1_name} but NOT on {v2_name}! UNHEDGED RISK!")
+                if self.notifier:
+                    await self.notifier.notify(
+                        f"MISMATCH: {symbol}",
+                        f"Found on {v1_name} (size={v1_size:.4f}), MISSING on {v2_name}!"
+                    )
+            elif not v1_found and v2_found:
+                log.error(f"[CARRY] POSITION MISMATCH: {symbol} exists on {v2_name} but NOT on {v1_name}! UNHEDGED RISK!")
+                if self.notifier:
+                    await self.notifier.notify(
+                        f"MISMATCH: {symbol}",
+                        f"Found on {v2_name} (size={v2_size:.4f}), MISSING on {v1_name}!"
+                    )
+            else:
+                log.error(f"[CARRY] POSITION MISSING: {symbol} not found on EITHER venue! Entry may have failed!")
+                if self.notifier:
+                    await self.notifier.notify(
+                        f"MISSING: {symbol}",
+                        f"Not found on {v1_name} or {v2_name}! Entry may have failed."
+                    )
+
+        except Exception as e:
+            log.error(f"[CARRY] Position verification failed for {symbol}: {e}")
+
+    # =========================================================================
+    # SECTION 7: UTILITIES
+    # =========================================================================
 
     def _calc_pnl(self, pos: CarryPosition, current_diff: float, hold_hours: float) -> float:
         """Estimate PnL = Yield Accrued + Realized Capital PnL (if any)."""

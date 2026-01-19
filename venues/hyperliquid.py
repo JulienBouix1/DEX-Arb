@@ -17,6 +17,7 @@ from websockets.exceptions import ConnectionClosed
 
 from core.orderbook import Book
 from venues.hl_client import HLClient
+from venues.base import VenueBase
 from core.dns_utils import get_connector
 
 log = logging.getLogger(__name__)
@@ -34,7 +35,7 @@ class OrderResult:
     reason: str = ""
     dry_run: bool = False
 
-class Hyperliquid:
+class Hyperliquid(VenueBase):
     def __init__(self, cfg: Dict[str, Any]) -> None:
         import os
         self.rest_url: str = cfg["rest_url"].rstrip("/")
@@ -326,8 +327,8 @@ class Hyperliquid:
         """Fetch average fill price for an order ID from HL history/status."""
         if not oid: return None
         try:
-            # hl_client.get_order_status returns raw API response
-            # res is raw payload from _hl.get_order_status
+            # Fetch order status from HL API
+            res = await self._hl.get_order_status(oid)
             if isinstance(res, dict):
                 # Standardize: SDK might return direct 'data' or wrapped in 'response'
                 data = res.get("response", {}).get("data", {}) if "response" in res else res.get("data", res)
@@ -364,6 +365,22 @@ class Hyperliquid:
     async def fetch_order_result(self, oid: int) -> Dict[str, Any]:
         """Fetch full order result."""
         return await self._hl.get_order_status(oid)
+
+    async def cancel_order(self, order_id: str, symbol: Optional[str] = None) -> bool:
+        """
+        Cancel an open order on Hyperliquid.
+
+        Note: HL SDK cancel requires coin name and order ID.
+        This is a simplified implementation.
+        """
+        try:
+            # HL cancel requires coin, but we might not have it
+            # For now, log and return False as this needs SDK enhancement
+            log.warning(f"[HL] cancel_order called for {order_id} - not fully implemented")
+            return False
+        except Exception as e:
+            log.error(f"[HL] cancel_order error: {e}")
+            return False
 
     # ---------- Internal WS ----------
     async def _ws_reader_loop(self) -> None:

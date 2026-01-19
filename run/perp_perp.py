@@ -31,8 +31,30 @@ Runner HL <-> Aster with integrated strategy, clean heartbeat, periodic equity r
     * Le runner ne place aucun ordre directement; il orchestre uniquement discovery,
       heartbeat, killswitch, lancement de tick().
 
-Lancement:
+Launch:
   python -m run.perp_perp --auto --hb-rows 40 --hb-interval 6.0
+
+=============================================================================
+FILE STRUCTURE (1800+ lines)
+=============================================================================
+
+SECTION 1: IMPORTS & LOGGING (Lines ~37-92)
+SECTION 2: DISCOVERY - Fetch universe from venues (Lines ~95-280)
+SECTION 3: MAPPING - Map symbols across venues (Lines ~286-372)
+SECTION 4: HELPERS - Price formatting, edge calculation (Lines ~372-460)
+SECTION 5: HEARTBEAT - Equity monitoring & display (Lines ~460-580)
+SECTION 6: SANITY FILTER - Validate pair consistency (Lines ~580-710)
+SECTION 7: MAIN - Bot initialization and event loops (Lines ~710+)
+    - Config loading
+    - Venue initialization
+    - Strategy setup
+    - Heartbeat loop
+    - Trade loop
+    - Discovery loop
+    - Carry loop
+    - Graceful shutdown
+
+=============================================================================
 """
 from __future__ import annotations
 
@@ -70,6 +92,8 @@ from strategies.perp_perp_arbitrage import PerpPerpArb, KillSwitch
 from strategies.carry_strategy import CarryStrategy
 from core.position_manager import PositionManager
 from core.dns_utils import get_connector
+from core.preflight import PreflightCheck, print_preflight_report
+from core.circuit_breaker import CircuitBreaker, CircuitOpenError
 
 
 # ---------- Logging ----------
@@ -459,26 +483,48 @@ def _edge_bps(ph: float, pa: float) -> float:
 
 async def _heartbeat_once(
     iter_no: int, hl: Hyperliquid, asr: Aster, lighter: Optional[Lighter], pairs_map: Dict[str, str], rows: int,
-    lighter_map: Dict[str, str] = None, lighter_enabled: bool = False
+    lighter_map: Dict[str, str] = None, lighter_enabled: bool = False,
+    circuit_breaker: Optional["CircuitBreaker"] = None
 ) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], str]:
     hl_eq = None
-    try: hl_eq = await hl.equity()
+    try:
+        if circuit_breaker and not circuit_breaker.is_available("HL"):
+            logging.getLogger("hb").warning("[HB] HL circuit OPEN - skipping equity call")
+        else:
+            hl_eq = await hl.equity()
+            if circuit_breaker:
+                circuit_breaker.record_success("HL")
     except Exception as e:
         logging.getLogger("hb").warning(f"HL Equity Error: {e}")
-        pass
-    
+        if circuit_breaker:
+            circuit_breaker.record_failure("HL", str(e))
+
     as_eq = None
-    try: as_eq = await asr.equity()
+    try:
+        if circuit_breaker and not circuit_breaker.is_available("ASTER"):
+            logging.getLogger("hb").warning("[HB] Aster circuit OPEN - skipping equity call")
+        else:
+            as_eq = await asr.equity()
+            if circuit_breaker:
+                circuit_breaker.record_success("ASTER")
     except Exception as e:
         logging.getLogger("hb").warning(f"Aster Equity Error: {e}")
-        pass
-    
+        if circuit_breaker:
+            circuit_breaker.record_failure("ASTER", str(e))
+
     lt_eq = None
     if lighter:
-        try: lt_eq = await lighter.equity()
+        try:
+            if circuit_breaker and not circuit_breaker.is_available("LIGHTER"):
+                logging.getLogger("hb").warning("[HB] Lighter circuit OPEN - skipping equity call")
+            else:
+                lt_eq = await lighter.equity()
+                if circuit_breaker:
+                    circuit_breaker.record_success("LIGHTER")
         except Exception as e:
             logging.getLogger("hb").warning(f"Lighter Equity Error: {e}")
-            pass
+            if circuit_breaker:
+                circuit_breaker.record_failure("LIGHTER", str(e))
         
     tot = None
     # Loose sum: sum whatever is available
@@ -825,16 +871,31 @@ async def main() -> None:
             scalp_paper = True
             carry_paper = True
 
-    live_mode = not scalp_paper
-    if not live_mode:
+    # Position Manager needs to be in LIVE mode if EITHER strategy is live
+    # This ensures real positions from Carry (even if Scalp is paper) get proper handling
+    live_mode = not scalp_paper or not carry_paper
+
+    if scalp_paper:
         print("\n*** [DRY-RUN] Scalp Mode (risk.yaml) = Paper. No real scalp orders. ***")
     else:
         print("\n*** [LIVE] Scalp Mode (risk.yaml) = LIVE. REAL ORDERS ACTIVE. ***")
+
+    # Log Position Manager mode explicitly
+    print(f"\n*** [POS MGR] Mode = {'LIVE' if live_mode else 'PAPER'} (any strategy live = live) ***")
 
     if carry_paper:
         print("*** [DRY-RUN] Carry Mode (risk.yaml) = Paper. ***")
     else:
         print("*** [LIVE] Carry Mode (risk.yaml) = LIVE. ***")
+
+    # Prominent LIVE TRADING banner when any strategy is live
+    if live_mode:
+        print("\n" + "=" * 60)
+        print("  ⚠️  LIVE TRADING ACTIVE - REAL MONEY AT RISK  ⚠️")
+        print("=" * 60)
+        print(f"  Scalp: {'LIVE' if not scalp_paper else 'Paper'}")
+        print(f"  Carry: {'LIVE' if not carry_paper else 'Paper'}")
+        print("=" * 60 + "\n")
 
     # Session start timestamp for PnL tracking
     bot_start_ts = time.time()
@@ -901,6 +962,59 @@ async def main() -> None:
                         pass
         if not started:
             raise RuntimeError(f"Venue missing start/connect: {v}")
+
+    # =========================================================================
+    # PRE-FLIGHT CHECKLIST
+    # =========================================================================
+    print("\nRunning pre-flight checks...")
+    preflight = PreflightCheck(venues_cfg, risk_cfg)
+    pf_passed, pf_results = await preflight.run_all(
+        hl=hl,
+        asr=asr,
+        lighter=lighter if lighter_enabled else None
+    )
+    print_preflight_report(pf_results, pf_passed)
+
+    if not pf_passed:
+        # Allow continuing in paper mode even if some checks fail
+        if not live_mode:
+            logging.getLogger("preflight").warning(
+                "[PREFLIGHT] Some checks failed but continuing in PAPER mode..."
+            )
+        else:
+            logging.getLogger("preflight").critical(
+                "[PREFLIGHT] Pre-flight checks failed in LIVE mode! Aborting."
+            )
+            sys.exit(1)
+
+    # =========================================================================
+    # CIRCUIT BREAKER (API Failure Protection)
+    # =========================================================================
+    def _on_circuit_open(venue: str) -> None:
+        """Callback when a venue circuit breaker trips."""
+        logging.getLogger("circuit").critical(
+            f"[CIRCUIT BREAKER] {venue} circuit OPEN - too many consecutive failures!"
+        )
+        # Notify via Discord/webhook
+        asyncio.create_task(notifier.notify(
+            "CIRCUIT_BREAKER",
+            f"⚠️ {venue} circuit breaker OPEN - API failures detected"
+        ))
+
+    def _on_circuit_close(venue: str) -> None:
+        """Callback when a venue circuit breaker recovers."""
+        logging.getLogger("circuit").info(
+            f"[CIRCUIT BREAKER] {venue} circuit CLOSED - service recovered"
+        )
+
+    circuit_breaker = CircuitBreaker(
+        failure_threshold=5,      # 5 consecutive failures to trip
+        success_threshold=2,       # 2 successes to recover
+        cooldown_seconds=60.0,     # 60s before testing recovery
+        on_circuit_open=_on_circuit_open,
+        on_circuit_close=_on_circuit_close,
+    )
+    logging.getLogger("boot").info("[BOOT] Circuit breaker initialized (threshold=5, cooldown=60s)")
 
     # Discovery (Internal retries are now inside _hl_universe / _aster_symbols)
     hl_uni = []
@@ -1182,7 +1296,7 @@ async def main() -> None:
         asr=asr,
         lighter=lighter if lighter_enabled else None,
         lighter_map=carry_lighter_map,  # Use carry-specific lighter map
-        cfg={},
+        cfg={"venues": venues_cfg},  # Pass venues config for fee calculation
         pairs_map=carry_pairs_map,  # Use carry-specific pairs
         risk=risk_cfg,
         notifier=notifier,
@@ -1211,8 +1325,27 @@ async def main() -> None:
                 pass
             await asyncio.sleep(0.1)
     
-    logging.getLogger("carry").info("[CARRY] Initialized: %d pairs (%d Carry-only, %d shared)", 
+    logging.getLogger("carry").info("[CARRY] Initialized: %d pairs (%d Carry-only, %d shared)",
                                      len(carry_pairs_map), len(carry_only), len(carry_pairs_map) - len(carry_only))
+
+    # Link CarryStrategy to PositionManager for entry lock checks
+    pos_mgr.carry_strategy = carry_strat
+    logging.getLogger("carry").info("[CARRY] Linked to PositionManager for entry lock protection")
+
+    # Wire up dashboard callbacks for emergency controls
+    async def _dashboard_close_all() -> dict:
+        """Close all carry positions - called from dashboard button."""
+        return await carry_strat.close_all_positions("DASHBOARD_CLOSE_ALL")
+
+    async def _dashboard_emergency_stop() -> None:
+        """Emergency stop - close positions and signal shutdown."""
+        logging.getLogger("dashboard").warning("[EMERGENCY] Stop triggered from dashboard!")
+        await carry_strat.close_all_positions("EMERGENCY_STOP")
+        stop.set()  # Signal main loop to exit
+
+    dash.set_close_positions_callback(_dashboard_close_all)
+    dash.set_emergency_stop_callback(_dashboard_emergency_stop)
+    logging.getLogger("dashboard").info("[DASHBOARD] Emergency callbacks configured")
 
     # Loops
     stop = asyncio.Event()
@@ -1238,7 +1371,8 @@ async def main() -> None:
             lt_map = lighter_map if lighter_enabled else {}
             
             hl_eq, as_eq, lt_eq, tot, text = await _heartbeat_once(
-                iter_no, hl, asr, lt_inst, pairs_map, args.hb_rows, lighter_map=lt_map, lighter_enabled=lighter_enabled
+                iter_no, hl, asr, lt_inst, pairs_map, args.hb_rows, lighter_map=lt_map, lighter_enabled=lighter_enabled,
+                circuit_breaker=circuit_breaker
             )
 
             # Equity display logic:
@@ -1454,12 +1588,20 @@ async def main() -> None:
                         stop.set()
                         break
 
-            # Legacy consecutive negative recap check (secondary safety)
-            if recap.neg_streak >= 5:
-                logging.getLogger("kill").warning(
-                    "Kill-switch: 5 consecutive negative equity recaps -> flat_all + stop"
+            # NOTE: Legacy "5 consecutive negative recaps" check REMOVED
+            # Kill-switch now relies ONLY on drawdown-based check above (max_drawdown_pct)
+            # This prevents false triggers from normal equity fluctuations
+
+            # --- Circuit Breaker Critical Check ---
+            # If ALL venue circuits are open, halt the bot
+            if circuit_breaker.all_open():
+                logging.getLogger("circuit").critical(
+                    "[CIRCUIT BREAKER] ALL CIRCUITS OPEN - All venues unreachable! HALTING."
                 )
-                await _try_flat_all(hl, asr, pairs_map)
+                await notifier.notify(
+                    "CIRCUIT_BREAKER",
+                    "🚨 CRITICAL: All venue circuits open - bot halting for safety"
+                )
                 stop.set()
                 break
 
@@ -1770,7 +1912,7 @@ async def main() -> None:
     """
     # DISABLED FLATTENING LOGIC FOR CARRY SAFETY
     try:
-        from run.flat import get_hl_positions, get_aster_positions, flatten_hl_position, flatten_aster_position
+        from run.flatten_cli import get_hl_positions, get_aster_positions, flatten_hl_position, flatten_aster_position
         # ... (flattening code removed/commented) ...
     except Exception as e:
         logging.getLogger("shutdown").error(f"[SHUTDOWN] Error during flatten: {e}")

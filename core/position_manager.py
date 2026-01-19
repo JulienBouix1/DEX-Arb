@@ -23,6 +23,12 @@ class PositionManager:
         self.log = logging.getLogger("pos_mgr")
         self.live_mode = live_mode
         self.strategy = strategy  # Reference to PerpPerpArb for paper equity updates
+        self.carry_strategy = None  # Will be set after CarryStrategy init - prevents orphan closure during entry
+
+        # Check if scalp strategy is enabled (Position Manager is primarily for scalp management)
+        self.scalp_enabled = bool(risk_cfg.get("scalp_enabled", False))
+        if not self.scalp_enabled:
+            self.log.info("[POS MGR] Scalp strategy DISABLED - Position Manager will only handle orphan detection")
 
         # Risk params - Load from scalp_management section if available
         mgr_cfg = self.risk_cfg.get("scalp_management", {})
@@ -36,8 +42,19 @@ class PositionManager:
         self.position_start_times: Dict[str, float] = {} # symbol -> tracking_start_time
         self.bad_symbols: Dict[str, float] = {} # symbol -> cooldown_expiry_ts (for stop-loss protection)
 
+        # Log Rate Limiting: Prevent heartbeat pollution
+        self._last_monitor_log: Dict[str, float] = {}  # symbol -> last_log_ts
+        self._monitor_log_interval = 60.0  # Log each position at most every 60 seconds
+
+        # Duplicate Close Prevention: Track in-flight close operations
+        self._closing_in_progress: set = set()  # symbols currently being closed
+
         # Reset real_pnl.csv on startup (fresh session)
         self._reset_real_pnl_csv()
+
+        # Clear startup mode confirmation
+        mode_str = "LIVE" if self.live_mode else "PAPER"
+        self.log.info(f"[POS MGR] Initialized in {mode_str} mode")
 
     def _reset_real_pnl_csv(self):
         """Reset real_pnl.csv with fresh header on startup (truncate history)."""
@@ -69,32 +86,47 @@ class PositionManager:
         2. Match them (find paired positions).
         3. Check exit conditions (Convergence, Stop Loss, Time Limit).
         4. Execute exits if needed.
+
+        NOTE: When scalp_enabled=False, skip scalp management but still detect orphans.
         """
         try:
+            # Skip scalp-specific management when scalp is disabled
+            # (Orphan detection still runs to catch unhedged positions)
+            if not self.scalp_enabled and not self.open_scalps:
+                # No scalp positions to manage and scalp disabled - quick return
+                # Still check for orphans periodically (every 10th call)
+                if not hasattr(self, '_orphan_check_counter'):
+                    self._orphan_check_counter = 0
+                self._orphan_check_counter += 1
+                if self._orphan_check_counter < 10:
+                    return
+                self._orphan_check_counter = 0
+
             # 1. Fetch Real Positions
             # HL: list of dicts {coin, sizing, entryPx, ...}
             # Aster: list of dicts {symbol, positionAmt, entryPrice, ...}
             # We need to standardize.
-            
-            # NOTE: SDKs must support get_positions. 
+
+            # NOTE: SDKs must support get_positions.
             # Assuming hl.get_positions() and asr.get_positions() exist and work.
-            
+
             hl_pos_raw = await self._fetch_hl_positions()
             as_pos_raw = await self._fetch_as_positions()
             lt_pos_raw = await self._fetch_lt_positions() if self.lighter else []
-            
+
             # 2. Match Pairs & Detect Orphans
             matches, orphans = self._match_positions(hl_pos_raw, as_pos_raw, lt_pos_raw)
-            
-            # 3. Manage Paired Positions (Convergence)
-            for m in matches:
-                await self._manage_pair(m)
-            
+
+            # 3. Manage Paired Positions (Convergence) - Skip if scalp disabled
+            if self.scalp_enabled:
+                for m in matches:
+                    await self._manage_pair(m)
+
             # 4. Manage Orphan Positions (Close Immediately)
             for o in orphans:
                 self.log.warning(f"[ORPHAN] Detected orphan position on {o['venue']} ({o.get('symbol') or o.get('coin')}). Closing...")
                 await self._close_orphan(o)
-                
+
         except Exception as e:
             self.log.error(f"Tick error: {e}")
 
@@ -229,6 +261,13 @@ class PositionManager:
                 })
             # Case D: Orphans
             else:
+                # CRITICAL: Check if carry strategy is currently placing a multi-leg entry
+                # If so, skip orphan detection to prevent closing legs mid-entry
+                if self.carry_strategy and hasattr(self.carry_strategy, 'is_entry_in_progress'):
+                    if self.carry_strategy.is_entry_in_progress(coin):
+                        self.log.debug(f"[POS MGR] Skipping orphan check for {coin} - carry entry in progress")
+                        continue  # Skip this coin entirely
+
                 if hp: orphans.append({'venue': 'HYPERLIQUID', 'symbol': coin, 'size': float(hp['size']), 'pos': hp})
                 if ap: orphans.append({'venue': 'ASTER', 'symbol': ap['symbol'], 'size': float(ap['size']), 'pos': ap})
                 if lp: orphans.append({'venue': 'LIGHTER', 'symbol': lp['symbol'], 'size': float(lp['size']), 'pos': lp})
@@ -400,12 +439,16 @@ class PositionManager:
             if sym not in self.position_start_times:
                 self.position_start_times[sym] = time.time()
                 
-            # Log status periodically with convergence data
-            target_captured = abs_entry_basis * self.take_profit_pct
-            self.log.info(
-                f"[POS MGR] MONITORING {sym} | Entry={abs_entry_basis:.1f}bps Target={target_captured:.1f}bps (15%) | "
-                f"Dir={direction} | PnL={net_liqd_pnl_bps:.1f}bps ({profit_captured_pct*100:.0f}%) | Hold={hold_hours:.2f}h | HL_Size={p['hl_size']}"
-            )
+            # Log status periodically with convergence data (RATE LIMITED)
+            now = time.time()
+            last_log = self._last_monitor_log.get(sym, 0.0)
+            if now - last_log >= self._monitor_log_interval:
+                self._last_monitor_log[sym] = now
+                target_captured = abs_entry_basis * self.take_profit_pct
+                self.log.info(
+                    f"[POS MGR] MONITORING {sym} | Entry={abs_entry_basis:.1f}bps Target={target_captured:.1f}bps (15%) | "
+                    f"Dir={direction} | PnL={net_liqd_pnl_bps:.1f}bps ({profit_captured_pct*100:.0f}%) | Hold={hold_hours:.2f}h | HL_Size={p['hl_size']}"
+                )
 
     async def _execute_close(self, p: Dict, reason: str, exit_basis: float):
         """
@@ -413,13 +456,20 @@ class PositionManager:
         """
         hl_coin = p['hl_coin']
         as_sym = p['symbol']
+
+        # DUPLICATE CLOSE GUARD: Prevent re-triggering close for the same position
+        if as_sym in self._closing_in_progress:
+            self.log.debug(f"[POS MGR] {as_sym} close already in progress, skipping duplicate")
+            return
+        self._closing_in_progress.add(as_sym)
+
         v_pair = p.get('venue_pair', 'HL-AS')
         hl_size = p.get('hl_size', 0.0)
         as_size = p.get('as_size', 0.0)
         lt_size = p.get('lt_size', 0.0)
-        
+
         self.log.info(f"[POS MGR] EXECUTING CLOSE for {as_sym}. Reason: {reason} ...")
-        
+
         # Penalize symbol if it hit stop loss (long cooldown to avoid revenge trading)
         if "STOP_LOSS" in reason:
             cooldown_duration = 1800 # 30 minutes
@@ -548,6 +598,9 @@ class PositionManager:
             del self.position_start_times[as_sym]
         if hl_coin in self.position_start_times:
             del self.position_start_times[hl_coin]
+
+        # Remove from closing_in_progress (allow future closes for this symbol)
+        self._closing_in_progress.discard(as_sym)
 
     async def _reconcile_trade(
         self, 

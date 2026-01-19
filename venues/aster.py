@@ -4,9 +4,12 @@ import asyncio, json, logging, time, hmac, hashlib, urllib.parse, os
 from typing import Any, Dict, Optional, Tuple, List
 import aiohttp, websockets
 from core.orderbook import Book
+from venues.base import VenueBase
 log = logging.getLogger(__name__)
 from core.dns_utils import get_connector
-class Aster:
+
+
+class Aster(VenueBase):
     def __init__(self, cfg: Dict[str, Any]) -> None:
         self.rest_url: str = cfg["rest_url"].rstrip("/")
         self.ws_url: str = cfg["ws_url"].rstrip("/")

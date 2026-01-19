@@ -1,3 +1,10 @@
+# ==========================================================================
+# AUTHORITATIVE VENUE CONFIGURATION
+# ==========================================================================
+# This is the single source of truth for venue settings (URLs, fees, limits).
+# Note: risk.yaml also has venue config but it's deprecated.
+# ==========================================================================
+
 notifier:
   kind: "discord"
   # pas d'URL en clair ici
@@ -37,6 +44,6 @@ lighter:
   api_key_index_env: "LIGHTER_API_KEY_INDEX"
   l1_address_env: "LIGHTER_L1_ADDRESS"
   fees:
-    maker_bps: 0.0
-    taker_bps: 5.0
+    maker_bps: 0.2      # 0.002%
+    taker_bps: 2.0      # 0.02%
   min_qty_usd: 10

@@ -237,18 +237,35 @@ class HLClient:
         """
         Hyperliquid dynamic rounding:
         - Price must be at most 5 significant digits.
+        - Price must also respect minimum tick sizes for very low prices.
         """
         if price <= 0: return price
-        
+
         # 1. HL Rule: Max 5 significant digits
         import math
-        # Helper for significant digits
         sig = 5
-        res = round(price, sig - int(math.floor(math.log10(abs(price)))) - 1)
-        
-        # 2. Safety cap on decimals (HL doesn't like more than 6-8 usually)
-        # However, for very small prices, log10 logic handles it.
-        # We also need to avoid floating point noise like 3.690000000001
+        try:
+            # Calculate significant digit rounding
+            res = round(price, sig - int(math.floor(math.log10(abs(price)))) - 1)
+        except ValueError:
+            # Handle edge case where price is too small for log10
+            res = round(price, 8)
+
+        # 2. CRITICAL: Clean up floating point representation noise
+        # Convert to string and back to remove precision artifacts like 0.01230000000001
+        res_str = f"{res:.10g}"  # 10 significant figures, strip trailing zeros
+        res = float(res_str)
+
+        # 3. Additional tick size validation for very small prices
+        # HL typically requires prices to be on tick boundaries (e.g., 0.0001 for some assets)
+        # If price is below 1, round to at most 6 decimal places
+        if res < 1.0:
+            res = round(res, 6)
+        elif res < 10.0:
+            res = round(res, 5)
+        elif res < 100.0:
+            res = round(res, 4)
+
         return float(res)
 
     def round_qty(self, coin: str, qty: float) -> float:
@@ -326,6 +343,9 @@ class HLClient:
                                 elif "error" in first:
                                     status = "error"
                                     reason = str(first.get("error", ""))
+                                    # DEBUG: Log price validation failures
+                                    if "invalid price" in reason.lower():
+                                        log.error(f"[HL] PRICE VALIDATION FAILED: coin={coin}, px={limit_px}, sz={sz}, is_buy={is_buy}, error={reason}")
             
             # Debug unusual status
             if status not in ("ok", "filled"):

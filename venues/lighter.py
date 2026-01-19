@@ -13,6 +13,7 @@ import aiohttp
 import lighter
 from eth_account import Account
 from core.orderbook import Book
+from venues.base import VenueBase
 from core.dns_utils import get_connector
 
 log = logging.getLogger(__name__)
@@ -41,10 +42,10 @@ try:
 except ImportError:
     from lighter import WsClient
 
-class Lighter:
+class Lighter(VenueBase):
     """
     Lighter.xyz Venue Adapter.
-    
+
     Implements public data fetching (Orderbook, Funding) via REST API v1.
     Execution is currently stubbed as it requires EIP-712 signing with exact schema.
     """
