@@ -49,6 +49,18 @@ class PositionManager:
         # Duplicate Close Prevention: Track in-flight close operations
         self._closing_in_progress: set = set()  # symbols currently being closed
 
+        # Orphan close cooldown: prevent spam when close fails (e.g., below min notional)
+        self._orphan_close_failures: Dict[str, Tuple[float, int]] = {}  # symbol -> (last_attempt_ts, failure_count)
+        self._orphan_cooldown_seconds = 300.0  # 5 minute cooldown after failed close
+        self._orphan_max_failures_before_alert = 3  # Alert after 3 consecutive failures
+
+        # P1 FIX: Orphan grace period - wait before closing to allow stale data to refresh
+        self._orphan_first_seen: Dict[str, float] = {}  # orphan_key -> first_seen_ts
+        self._orphan_grace_period_seconds = 30.0  # Wait 30s before closing orphan
+
+        # Notifier for alerts (will be set externally)
+        self.notifier = None
+
         # Reset real_pnl.csv on startup (fresh session)
         self._reset_real_pnl_csv()
 
@@ -122,10 +134,53 @@ class PositionManager:
                 for m in matches:
                     await self._manage_pair(m)
 
-            # 4. Manage Orphan Positions (Close Immediately)
+            # 4. Manage Orphan Positions with Grace Period
+            now = time.time()
+            current_orphan_keys = set()
+
             for o in orphans:
-                self.log.warning(f"[ORPHAN] Detected orphan position on {o['venue']} ({o.get('symbol') or o.get('coin')}). Closing...")
+                venue = o['venue']
+                sym = o.get('symbol') or o.get('coin')
+                size = o['size']
+                orphan_key = f"{venue}:{sym}"
+                current_orphan_keys.add(orphan_key)
+
+                # P4 FIX: Ask carry strategy to validate before closing
+                if self.carry_strategy and hasattr(self.carry_strategy, 'validate_orphan'):
+                    if not await self.carry_strategy.validate_orphan(sym, venue, size):
+                        self.log.info(f"[ORPHAN] Carry strategy rejected orphan closure for {orphan_key}")
+                        continue
+
+                # P1 FIX: Track first-seen time and enforce grace period
+                if orphan_key not in self._orphan_first_seen:
+                    self._orphan_first_seen[orphan_key] = now
+                    # P2 FIX: Enhanced logging with full context
+                    self.log.warning(
+                        f"[ORPHAN CANDIDATE] Detected on {venue}: {sym} size={size:.4f} | "
+                        f"Grace period: {self._orphan_grace_period_seconds}s before close"
+                    )
+                    continue  # Don't close yet - wait for grace period
+
+                first_seen = self._orphan_first_seen[orphan_key]
+                elapsed = now - first_seen
+
+                if elapsed < self._orphan_grace_period_seconds:
+                    remaining = self._orphan_grace_period_seconds - elapsed
+                    self.log.debug(f"[ORPHAN] {orphan_key} in grace period ({remaining:.1f}s remaining)")
+                    continue  # Still in grace period
+
+                # Grace period elapsed - proceed to close
+                self.log.warning(
+                    f"[ORPHAN] Closing {venue} orphan: {sym} size={size:.4f} | "
+                    f"First seen {elapsed:.1f}s ago"
+                )
                 await self._close_orphan(o)
+
+            # Clean up tracking for orphans no longer detected
+            stale_keys = set(self._orphan_first_seen.keys()) - current_orphan_keys
+            for key in stale_keys:
+                del self._orphan_first_seen[key]
+                self.log.debug(f"[ORPHAN] Cleared tracking for {key} - no longer detected")
 
         except Exception as e:
             self.log.error(f"Tick error: {e}")
@@ -151,33 +206,104 @@ class PositionManager:
     async def _close_orphan(self, o: Dict):
         """
         Close a single orphan position.
+
+        NOTE: We use reduce_only=True for all venues to prevent accidentally
+        creating new positions. If the position was already closed or changed direction,
+        the reduce_only error is expected and handled gracefully.
+
+        FIX: Aster DOES support reduceOnly - the previous comment was incorrect.
+        Using reduce_only=True allows closing positions below min notional ($5.0).
         """
         venue = o['venue']
         size = o['size']
+        sym = o.get('symbol') or o.get('coin')
+        orphan_key = f"{venue}:{sym}"
+
+        # Check cooldown - skip if we recently failed to close this orphan
+        now = time.time()
+        if orphan_key in self._orphan_close_failures:
+            last_attempt, failure_count = self._orphan_close_failures[orphan_key]
+            if now - last_attempt < self._orphan_cooldown_seconds:
+                # Still in cooldown - log at debug level to reduce spam
+                remaining = (self._orphan_cooldown_seconds - (now - last_attempt)) / 60.0
+                self.log.debug(f"[ORPHAN] {orphan_key} in cooldown ({remaining:.1f}m remaining, {failure_count} failures)")
+                return
+
         try:
+            success = False
             if venue == 'HYPERLIQUID':
                 coin = o['symbol']
                 side = "SELL" if size > 0 else "BUY"
-                # Aggressive Market Close for protection
-                # FIX: Use GTC (ioc=False) to ensure execution even in thin liquidity
-                await self.hl.place_order(coin, side, abs(size), ioc=False, reduce_only=True, price=None)
-                self.log.info(f"[ORPHAN FIX] Closed HL orphan {coin} size={size}")
-                
+                result = await self.hl.place_order(coin, side, abs(size), ioc=False, reduce_only=True, price=None)
+                # FIX: Check for reduce_only error and handle gracefully
+                if result.get("status") == "error" and "Reduce only" in str(result.get("reason", "")):
+                    self.log.info(f"[ORPHAN FIX] HL {coin} position already closed or changed direction")
+                    success = True  # Position already gone, consider success
+                else:
+                    self.log.info(f"[ORPHAN FIX] Closed HL orphan {coin} size={size}")
+                    success = True
+
             elif venue == 'ASTER':
                 sym = o['symbol']
                 side = "SELL" if size > 0 else "BUY"
-                await self.asr.place_order(sym, side, abs(size), ioc=False, reduce_only=True, price=None)
-                self.log.info(f"[ORPHAN FIX] Closed AS orphan {sym} size={size}")
+                # FIX: Aster DOES support reduce_only=True - this allows closing dust positions below min notional
+                result = await self.asr.place_order(sym, side, abs(size), ioc=False, reduce_only=True, price=None)
+                # Check for errors
+                if result.get("code") and result.get("code") != 200:
+                    error_msg = result.get("msg", str(result))
+                    self.log.warning(f"[ORPHAN] AS {sym} close failed: {error_msg}")
+                    await self._handle_orphan_failure(orphan_key, sym, venue, size, error_msg)
+                else:
+                    self.log.info(f"[ORPHAN FIX] Closed AS orphan {sym} size={size}")
+                    success = True
 
             elif venue == 'LIGHTER':
                 sym = o['symbol']
                 side = "SELL" if size > 0 else "BUY"
-                # Use LIMIT with GTC (ioc=False) for Lighter too
-                await self.lighter.place_order(sym, side, abs(size), ioc=False, reduce_only=True, price=None)
-                self.log.info(f"[ORPHAN FIX] Closed LT orphan {sym} size={size}")
-                
+                result = await self.lighter.place_order(sym, side, abs(size), ioc=False, reduce_only=True, price=None)
+                # FIX: Check for reduce_only error and handle gracefully
+                if result.get("status") == "error" and "reduce" in str(result.get("reason", "")).lower():
+                    self.log.info(f"[ORPHAN FIX] LT {sym} position already closed or changed direction")
+                    success = True
+                else:
+                    self.log.info(f"[ORPHAN FIX] Closed LT orphan {sym} size={size}")
+                    success = True
+
+            # Clear failure tracking on success
+            if success and orphan_key in self._orphan_close_failures:
+                del self._orphan_close_failures[orphan_key]
+
         except Exception as e:
+            error_msg = str(e)
             self.log.error(f"Failed to close orphan {o}: {e}")
+            await self._handle_orphan_failure(orphan_key, sym, venue, size, error_msg)
+
+    async def _handle_orphan_failure(self, orphan_key: str, sym: str, venue: str, size: float, error_msg: str):
+        """Track orphan close failures and alert after repeated failures."""
+        now = time.time()
+
+        # Update failure tracking
+        if orphan_key in self._orphan_close_failures:
+            _, failure_count = self._orphan_close_failures[orphan_key]
+            failure_count += 1
+        else:
+            failure_count = 1
+        self._orphan_close_failures[orphan_key] = (now, failure_count)
+
+        # Alert after max failures
+        if failure_count >= self._orphan_max_failures_before_alert:
+            alert_msg = f"ORPHAN CLOSE FAILED: {venue} {sym} (size={size:.6f}) - {failure_count} attempts failed. Error: {error_msg}"
+            self.log.error(f"[ORPHAN ALERT] {alert_msg}")
+
+            # Send notification if notifier available
+            if self.notifier:
+                try:
+                    await self.notifier.notify("Orphan Close Failed", alert_msg)
+                except Exception as e:
+                    self.log.warning(f"[ORPHAN] Failed to send alert: {e}")
+
+            # Reset counter after alert (will alert again after another N failures)
+            self._orphan_close_failures[orphan_key] = (now, 0)
 
     def _match_positions(self, hl_pos: List[Dict], as_pos: List[Dict], lt_pos: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
         """
@@ -267,6 +393,18 @@ class PositionManager:
                     if self.carry_strategy.is_entry_in_progress(coin):
                         self.log.debug(f"[POS MGR] Skipping orphan check for {coin} - carry entry in progress")
                         continue  # Skip this coin entirely
+
+                # CRITICAL FIX: Check if this coin is part of a tracked carry position
+                # Carry positions may have legs on different venue pairs (HL-AS, AS-LT, HL-LT)
+                # so position_manager may see only one leg but it's NOT an orphan
+                if self.carry_strategy and hasattr(self.carry_strategy, 'positions'):
+                    is_tracked = any(
+                        pos.hl_coin == coin
+                        for pos in self.carry_strategy.positions.values()
+                    )
+                    if is_tracked:
+                        self.log.debug(f"[POS MGR] Skipping orphan for {coin} - tracked by carry strategy")
+                        continue  # Skip - this is a valid carry position leg
 
                 if hp: orphans.append({'venue': 'HYPERLIQUID', 'symbol': coin, 'size': float(hp['size']), 'pos': hp})
                 if ap: orphans.append({'venue': 'ASTER', 'symbol': ap['symbol'], 'size': float(ap['size']), 'pos': ap})

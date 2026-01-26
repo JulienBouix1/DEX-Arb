@@ -16,12 +16,14 @@ class Dashboard:
         self.app.router.add_get("/api/state", self._handle_state)
         self.app.router.add_post("/api/emergency_stop", self._handle_emergency_stop)
         self.app.router.add_post("/api/close_all_positions", self._handle_close_positions)
+        self.app.router.add_post("/api/close_position", self._handle_close_position)
         self.runner: Optional[web.AppRunner] = None
         self.site: Optional[web.TCPSite] = None
 
         # Callbacks for emergency actions (set by runner)
         self._emergency_stop_callback: Optional[Callable[[], Awaitable[None]]] = None
         self._close_positions_callback: Optional[Callable[[], Awaitable[dict]]] = None
+        self._close_position_callback: Optional[Callable[[str], Awaitable[dict]]] = None
 
         # State
         self.state: Dict[str, Any] = {
@@ -33,11 +35,12 @@ class Dashboard:
             "scalp_paper_equity": 1000.0,  # Paper equity for Scalp (separate from real)
             "open_positions": [],
             "carry_positions": [],  # List of Carry positions
-            "carry_stats": {"entries": 0, "exits": 0, "wins": 0, "losses": 0, "paper_pnl_usd": 0.0, "session_pnl_usd": 0.0, "equity": 1000.0, "realized_pnl": 0.0},
+            "carry_stats": {"entries": 0, "exits": 0, "wins": 0, "losses": 0, "paper_pnl_usd": 0.0, "session_pnl_usd": 0.0, "equity": 1000.0, "realized_pnl": 0.0, "unrealized_mtm": 0.0, "session_realized_pnl": 0.0, "session_start_equity": 0.0, "session_equity_mtm": 0.0},
             "scalp_pairs": [],  # List of symbols active for Scalp
             "carry_pairs": [],  # List of symbols active for Carry
             "funding_rates": [],  # List of {symbol, hl_rate, as_rate, lt_rate, spread, direction}
             "blocked_pairs": [],  # List of {symbol, reason, until_ts} for auto-blocklisted pairs
+            "entry_attempts": [],  # List of carry entry attempts (failures, partial fills, orphans)
             "session_pnl": {"scalp_usd": 0.0, "carry_usd": 0.0, "global_usd": 0.0},  # Session PnL
             "strategy_modes": {"scalp": "PAPER", "carry": "PAPER"},
             "strategy_allocs": {"scalp": 0.50, "carry": 0.80},
@@ -107,14 +110,25 @@ class Dashboard:
         self.state["carry_positions"] = positions
 
     def update_carry_stats(self, entries: int, equity: float, realized_pnl: float = 0.0,
-                           exits: int = 0, wins: int = 0, losses: int = 0) -> None:
-        """Update stats for Carry strategy."""
+                           exits: int = 0, wins: int = 0, losses: int = 0,
+                           unrealized_mtm: float = 0.0, session_realized_pnl: float = 0.0,
+                           session_start_equity: float = 0.0, session_equity_mtm: float = 0.0) -> None:
+        """Update stats for Carry strategy.
+
+        PHASE 2 FIX (2026-01-22): Added unrealized_mtm and session_realized_pnl
+        to show true realized PNL separate from open position MTM.
+        FIX 2026-01-24: Added session_start_equity and session_equity_mtm tracking.
+        """
         self.state["carry_stats"]["entries"] = entries
         self.state["carry_stats"]["exits"] = exits
         self.state["carry_stats"]["wins"] = wins
         self.state["carry_stats"]["losses"] = losses
         self.state["carry_stats"]["equity"] = equity
         self.state["carry_stats"]["realized_pnl"] = realized_pnl
+        self.state["carry_stats"]["unrealized_mtm"] = unrealized_mtm
+        self.state["carry_stats"]["session_realized_pnl"] = session_realized_pnl
+        self.state["carry_stats"]["session_start_equity"] = session_start_equity
+        self.state["carry_stats"]["session_equity_mtm"] = session_equity_mtm
 
     def update_pair_lists(self, scalp_pairs: List[str], carry_pairs: List[str]) -> None:
         """Update lists of pairs active for each strategy (for color coding)."""
@@ -129,14 +143,33 @@ class Dashboard:
         """
         self.state["blocked_pairs"] = blocked
 
-    def update_session_pnl(self, scalp_usd: float = None, carry_usd: float = None) -> None:
-        """Update session PnL values. Pass None to keep existing value."""
+    def update_entry_attempts(self, attempts: List[Dict[str, Any]]) -> None:
+        """Update carry entry attempts for dashboard display (failures, partial fills, orphans).
+
+        Args:
+            attempts: List of dicts with {timestamp, symbol, v1, v2, v1_status, v2_status, orphan_created, orphan_closed, reason}
+        """
+        self.state["entry_attempts"] = attempts
+
+    def update_session_pnl(self, scalp_usd: float = None, carry_usd: float = None,
+                           carry_realized_usd: float = None, carry_unrealized_usd: float = None) -> None:
+        """Update session PnL values. Pass None to keep existing value.
+
+        PHASE 2 FIX (2026-01-22): Added separate realized and unrealized tracking.
+        - carry_usd: Legacy total (realized + unrealized) for backwards compatibility
+        - carry_realized_usd: Only closed trade PNL
+        - carry_unrealized_usd: Open position MTM
+        """
         if scalp_usd is not None:
             self.state["session_pnl"]["scalp_usd"] = scalp_usd
             self.state["scalp_stats"]["session_pnl_usd"] = scalp_usd
         if carry_usd is not None:
             self.state["session_pnl"]["carry_usd"] = carry_usd
             self.state["carry_stats"]["session_pnl_usd"] = carry_usd
+        if carry_realized_usd is not None:
+            self.state["carry_stats"]["session_realized_pnl"] = carry_realized_usd
+        if carry_unrealized_usd is not None:
+            self.state["carry_stats"]["unrealized_mtm"] = carry_unrealized_usd
         # Auto-calculate global
         s = self.state["session_pnl"]["scalp_usd"]
         c = self.state["session_pnl"]["carry_usd"]
@@ -164,6 +197,10 @@ class Dashboard:
     def set_close_positions_callback(self, callback: Callable[[], Awaitable[dict]]) -> None:
         """Set callback for close all positions button."""
         self._close_positions_callback = callback
+
+    def set_close_position_callback(self, callback: Callable[[str], Awaitable[dict]]) -> None:
+        """Set callback for manual close single position button."""
+        self._close_position_callback = callback
 
     async def _handle_state(self, request: web.Request) -> web.Response:
         return web.json_response(self.state)
@@ -215,6 +252,34 @@ class Dashboard:
 
         except Exception as e:
             log.error(f"[Dashboard] Close positions error: {e}")
+            result["success"] = False
+            result["message"] = f"Error: {e}"
+
+        return web.json_response(result)
+
+    async def _handle_close_position(self, request: web.Request) -> web.Response:
+        """Handle manual close single position request."""
+        result = {"success": False, "message": "No callback configured"}
+
+        try:
+            data = await request.json()
+            symbol = data.get("symbol", "")
+            if not symbol:
+                result["message"] = "No symbol provided"
+                return web.json_response(result)
+
+            log.warning(f"[Dashboard] MANUAL CLOSE requested for {symbol}")
+
+            if self._close_position_callback:
+                close_result = await self._close_position_callback(symbol)
+                result["success"] = close_result.get("success", False)
+                result["message"] = close_result.get("message", "Position closed")
+                result["symbol"] = symbol
+            else:
+                result["message"] = "Close position callback not configured"
+
+        except Exception as e:
+            log.error(f"[Dashboard] Close position error: {e}")
             result["success"] = False
             result["message"] = f"Error: {e}"
 
@@ -279,6 +344,12 @@ class Dashboard:
         .btn-close-pos:hover { background: #ffa726; }
         .btn-disabled { background: #555 !important; cursor: not-allowed; }
         #emergency_status { color: #888; font-size: 0.9em; }
+        .btn-close-single {
+            background: #e53935; color: white; border: none; border-radius: 4px;
+            padding: 4px 10px; cursor: pointer; font-size: 0.8em; transition: all 0.2s;
+        }
+        .btn-close-single:hover { background: #f44336; transform: scale(1.05); }
+        .btn-close-single:disabled { background: #555; cursor: not-allowed; }
 
         /* Mobile responsive */
         @media (max-width: 768px) {
@@ -446,6 +517,14 @@ class Dashboard:
                         <div style="color:#888">Unrealized MTM</div>
                         <div class="val" id="carry_unrealized2">$0.00</div>
                     </div>
+                    <div class="metric">
+                        <div style="color:#888">Session Start</div>
+                        <div class="val" id="carry_session_start" style="color:#888">$0.00</div>
+                    </div>
+                    <div class="metric">
+                        <div style="color:#888">Session MTM</div>
+                        <div class="val" id="carry_session_mtm">$0.00</div>
+                    </div>
                 </div>
 
                 <!-- Live Mode: Real Equity by Venue -->
@@ -472,9 +551,20 @@ class Dashboard:
                      <span style="color:#888">Exits:</span> <span id="carry_exits">0</span></div>
 
                 <h3 style="color:#888;margin-top:20px;">Open Positions</h3>
-                <div class="scroll-box" style="max-height:200px;">
+                <div class="scroll-box" style="max-height:250px;">
                     <table id="carry_positions">
-                        <thead><tr><th>Pair</th><th>Direction</th><th>Size Total</th><th>Per Venue</th><th>Hold Time</th><th>Entry Rate</th><th>Funding PnL</th><th>Price PnL</th><th>MTM</th></tr></thead>
+                        <thead><tr>
+                            <th>Pair</th>
+                            <th>Direction</th>
+                            <th>Size (V1/V2)</th>
+                            <th>Hold</th>
+                            <th>Yield</th>
+                            <th>Funding</th>
+                            <th title="Price impact from entry to now">Price Δ</th>
+                            <th>Fees (Paid/Exit)</th>
+                            <th>Net MTM</th>
+                            <th>Action</th>
+                        </tr></thead>
                         <tbody></tbody>
                     </table>
                 </div>
@@ -483,6 +573,14 @@ class Dashboard:
                 <div class="scroll-box" style="max-height:120px;">
                     <table id="blocked_pairs_table">
                         <thead><tr><th>Pair</th><th>Reason</th><th>Remaining</th></tr></thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+
+                <h3 style="color:#ff5252;margin-top:20px;">Entry Attempts <span id="entry_attempts_count" style="font-size:0.7em;">(0)</span></h3>
+                <div class="scroll-box" style="max-height:180px;">
+                    <table id="entry_attempts_table">
+                        <thead><tr><th>Time</th><th>Pair</th><th>V1</th><th>V2</th><th>Orphan</th><th>Reason</th></tr></thead>
                         <tbody></tbody>
                     </table>
                 </div>
@@ -564,6 +662,28 @@ class Dashboard:
             }
         }
 
+        async function closePosition(symbol) {
+            if (!confirm(`Close position for ${symbol}?`)) return;
+
+            const status = document.getElementById('emergency_status');
+            status.innerText = `Closing ${symbol}...`;
+            status.style.color = '#ff9800';
+
+            try {
+                const resp = await fetch('/api/close_position', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ symbol: symbol })
+                });
+                const data = await resp.json();
+                status.innerText = data.message;
+                status.style.color = data.success ? '#00e676' : '#ff5252';
+            } catch (e) {
+                status.innerText = 'Error: ' + e.message;
+                status.style.color = '#ff5252';
+            }
+        }
+
         // Chart Setup
         const ctx = document.getElementById('equityChart').getContext('2d');
         const chart = new Chart(ctx, {
@@ -628,27 +748,56 @@ class Dashboard:
                 `).join('');
 
                 // Carry Positions Table (enhanced for carry tab)
+                // FIX 2026-01-22: Updated to show per-leg sizes and fee breakdown
                 const carry_pos = data.carry_positions || [];
                 const tbody_carry = document.querySelector('#carry_positions tbody');
                 tbody_carry.innerHTML = carry_pos.map(p => {
                     const mtm = p.mtm_bps || 0;
                     const mtmClass = mtm >= 0 ? 'green' : 'red';
                     const sizeUsd = p.size_usd || 0;
-                    const sizePerVenue = sizeUsd / 2;  // Each leg gets half
+                    const sizeV1 = p.size_v1_usd || (sizeUsd / 2);
+                    const sizeV2 = p.size_v2_usd || (sizeUsd / 2);
                     const fundingPnl = p.funding_pnl_usd || 0;
                     const pricePnl = p.price_pnl_usd || 0;
-                    const totalMtm = p.total_mtm_usd || (fundingPnl + pricePnl);
+                    const feeCost = p.fee_cost_usd || 0;
+                    const totalMtm = p.total_mtm_usd || (fundingPnl + pricePnl - feeCost);
+
+                    // FIX 2026-01-22: Fee breakdown - paid fees vs projected exit fees
+                    const feesPaid = p.total_fees_paid_usd || 0;
+                    const exitFeeProj = p.exit_fee_projected_usd || 0;
+                    const makerLegs = p.maker_legs || 0;
+                    const takerLegs = p.taker_legs || 0;
+                    const scaleCount = p.scale_up_count || 0;
+
+                    // Show leg venues
+                    const leg1 = p.leg1_venue || 'V1';
+                    const leg2 = p.leg2_venue || 'V2';
+
+                    // FIX 2026-01-25: Yield display with correct sign handling
+                    // Keep raw value for sign detection, show absolute for magnitude
+                    const currYieldRaw = p.current_funding_diff_bps ?? p.entry_funding_diff_bps ?? 0;
+                    const currYield = Math.abs(currYieldRaw);
+                    const yieldReceiving = p.yield_is_receiving !== false && currYieldRaw >= 0;
+                    const yieldClass = yieldReceiving ? 'green' : 'red';
+                    const yieldSign = yieldReceiving ? '+' : '-';
+                    const entryYield = p.entry_funding_diff_bps || 0;
+
+                    // FIX 2026-01-25: Get current prices for tooltip
+                    const px1 = p.current_px_leg1 || 0;
+                    const px2 = p.current_px_leg2 || 0;
+
                     return `
                     <tr>
-                        <td>${p.symbol}</td>
-                        <td>${p.direction}</td>
-                        <td style="color:#ffcc00">$${sizeUsd.toFixed(0)}</td>
-                        <td style="color:#888">$${sizePerVenue.toFixed(0)}/leg</td>
+                        <td>${p.symbol}${scaleCount > 0 ? ' <span style="color:#ba68c8;font-size:0.8em">(+' + scaleCount + ')</span>' : ''}</td>
+                        <td style="font-size:0.85em">${p.direction}</td>
+                        <td style="color:#ffcc00">$${sizeUsd.toFixed(0)} <span style="color:#666;font-size:0.75em">(${leg1}:$${sizeV1.toFixed(0)}/${leg2}:$${sizeV2.toFixed(0)})</span></td>
                         <td>${p.hold_hours.toFixed(1)}h</td>
-                        <td class="${p.entry_funding_diff_bps > 0 ? 'green' : 'red'}">${p.entry_funding_diff_bps.toFixed(1)} bps</td>
+                        <td class="${yieldClass}">${yieldSign}${currYield.toFixed(1)}bps <span style="color:#666;font-size:0.75em">(e:${entryYield.toFixed(0)})</span></td>
                         <td class="${fundingPnl >= 0 ? 'green' : 'red'}">$${fundingPnl.toFixed(2)}</td>
-                        <td class="${pricePnl >= 0 ? 'green' : 'red'}">$${pricePnl.toFixed(2)}</td>
-                        <td class="${mtmClass}">$${totalMtm.toFixed(2)} (${mtm.toFixed(1)}bps)</td>
+                        <td class="${pricePnl >= 0 ? 'green' : 'red'}" title="Current: ${leg1}=$${px1.toFixed(4)} / ${leg2}=$${px2.toFixed(4)}">$${pricePnl.toFixed(2)}</td>
+                        <td style="color:#ff9800" title="Paid: $${feesPaid.toFixed(2)} (${makerLegs}M/${takerLegs}T legs)&#10;Exit proj: $${exitFeeProj.toFixed(2)} (taker)">-$${feeCost.toFixed(2)} <span style="font-size:0.7em">(${feesPaid.toFixed(2)}+${exitFeeProj.toFixed(2)})</span></td>
+                        <td class="${mtmClass}">$${totalMtm.toFixed(2)} <span style="font-size:0.75em">(${mtm.toFixed(1)}bps)</span></td>
+                        <td><button class="btn-close-single" onclick="closePosition('${p.symbol}')">Close</button></td>
                     </tr>`;
                 }).join('');
 
@@ -760,6 +909,21 @@ class Dashboard:
                     carry_realized.className = realized >= 0 ? 'green' : 'red';
                 }
 
+                // FIX 2026-01-24: Session equity display
+                const sessionStart = cs.session_start_equity || 0;
+                const sessionMtm = cs.session_equity_mtm || 0;
+
+                const carry_session_start = document.getElementById('carry_session_start');
+                if (carry_session_start) {
+                    carry_session_start.innerText = '$' + sessionStart.toFixed(2);
+                }
+
+                const carry_session_mtm = document.getElementById('carry_session_mtm');
+                if (carry_session_mtm) {
+                    carry_session_mtm.innerText = (sessionMtm >= 0 ? '+' : '') + '$' + sessionMtm.toFixed(2);
+                    carry_session_mtm.className = sessionMtm >= 0 ? 'green' : 'red';
+                }
+
                 // Show live equity panel only if carry is LIVE mode (use carry_is_live from above)
                 const livePanel = document.getElementById('carry_live_equity');
                 if (livePanel) {
@@ -787,6 +951,34 @@ class Dashboard:
                 }
                 const blocked_count = document.getElementById('blocked_count');
                 if (blocked_count) blocked_count.innerText = '(' + blocked.length + ')';
+
+                // Entry Attempts Table (failures, partial fills, orphans)
+                const attempts = data.entry_attempts || [];
+                const attempts_tbody = document.querySelector('#entry_attempts_table tbody');
+                if (attempts_tbody) {
+                    attempts_tbody.innerHTML = attempts.map(a => {
+                        const v1_class = a.v1_status.includes("CONFIRMED") || a.v1_status.includes("FILLED") ? "green" : "red";
+                        const v2_class = a.v2_status.includes("CONFIRMED") || a.v2_status.includes("FILLED") ? "green" : "red";
+                        const orphan_text = a.orphan_created ? (a.orphan_closed ? "CLOSED" : "OPEN!") : "-";
+                        const orphan_style = a.orphan_created && !a.orphan_closed ? "color:#ff5252;font-weight:bold;" : "";
+                        const time_str = new Date(a.timestamp * 1000).toLocaleTimeString();
+                        const age_str = a.age_hours < 1 ? (a.age_hours * 60).toFixed(0) + 'm' : a.age_hours.toFixed(1) + 'h';
+                        return `<tr>
+                            <td>${time_str} (${age_str} ago)</td>
+                            <td>${a.symbol || a.hl_coin}</td>
+                            <td class="${v1_class}">${a.v1}: ${a.v1_status}</td>
+                            <td class="${v2_class}">${a.v2}: ${a.v2_status}</td>
+                            <td style="${orphan_style}">${orphan_text}</td>
+                            <td style="color:#888;font-size:0.85em;">${a.reason}</td>
+                        </tr>`;
+                    }).join('');
+                }
+                const attempts_count = document.getElementById('entry_attempts_count');
+                if (attempts_count) {
+                    const open_orphans = attempts.filter(a => a.orphan_created && !a.orphan_closed).length;
+                    attempts_count.innerText = '(' + attempts.length + (open_orphans > 0 ? ', ' + open_orphans + ' OPEN!' : '') + ')';
+                    attempts_count.style.color = open_orphans > 0 ? '#ff5252' : '#888';
+                }
 
                 // Equity Info Bar
                 const start = data.start_equity || 0;

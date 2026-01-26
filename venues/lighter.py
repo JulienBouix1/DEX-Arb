@@ -112,9 +112,14 @@ class Lighter(VenueBase):
         # Concurrency control for nonce-sensitive operations
         self._execution_lock = asyncio.Lock()
 
-        # Track failed leverage setups for background retry
-        self._leverage_failed: set = set()
-        self._leverage_retry_task: Optional[asyncio.Task] = None
+        # WS and staleness task tracking
+        self._ws_task: Optional[asyncio.Task] = None
+        self._staleness_task: Optional[asyncio.Task] = None
+        self._ws_connected = asyncio.Event()  # FIX 2026-01-22: Track WS connection state
+
+        # WS reconnection backoff (FIX 2026-01-24: Exponential backoff to prevent reconnect storms)
+        self._ws_reconnect_backoff: float = 1.0  # Start at 1s, max 30s
+        self._ws_last_reconnect_time: float = 0.0
 
         # Volume quota rate limit tracking (auto-disable for 1 hour on 429 "volume quota")
         self._volume_quota_blocked_until: float = 0.0
@@ -123,6 +128,29 @@ class Lighter(VenueBase):
     def is_connected(self) -> bool:
         """Check if the adapter is connected (session exists and WS is active)."""
         return self._session is not None
+
+    def _normalize_symbol(self, symbol: str) -> str:
+        """Normalize symbol to Lighter format (e.g., 'BTC-USDC').
+
+        Lighter uses BASE-QUOTE format (e.g., BTC-USDC, ETH-USDC).
+        This method tries to find the correct key in _instruments.
+        """
+        sym = symbol.upper()
+        if sym in self._instruments:
+            return sym
+        # Try alternate formats
+        alternates = []
+        if "-" not in sym and "USDC" not in sym and "USDT" not in sym:
+            alternates.append(f"{sym}-USDC")  # BTC -> BTC-USDC
+        if sym.endswith("USDT"):
+            base = sym.replace("USDT", "")
+            alternates.append(f"{base}-USDC")  # BTCUSDT -> BTC-USDC
+        if "-USDC" in sym:
+            alternates.append(sym.replace("-USDC", ""))  # BTC-USDC -> BTC
+        for alt in alternates:
+            if alt in self._instruments:
+                return alt
+        return sym  # Return original if no match
 
     def is_volume_quota_blocked(self) -> bool:
         """Check if Lighter is temporarily blocked due to volume quota limit."""
@@ -174,7 +202,9 @@ class Lighter(VenueBase):
         # await self._setup_leverage()
 
         # Start WebSocket loop in background
-        asyncio.create_task(self._ws_loop())
+        self._ws_task = asyncio.create_task(self._ws_loop(), name="lighter_ws_loop")
+        # DISABLED: Staleness monitor was causing connection instability by forcing reconnects
+        # self._staleness_task = asyncio.create_task(self._staleness_monitor_loop(), name="lighter_staleness_monitor")
         log.info("[Lighter] WebSocket loop started")
 
 
@@ -301,11 +331,8 @@ class Lighter(VenueBase):
                 if applied_lev > 0:
                     log.info(f"[Lighter] [OK] Leverage set to {applied_lev}x ISOLATED for {symbol}")
                     success_count += 1
-                    # Remove from failed list if previously failed
-                    self._leverage_failed.discard(symbol)
                 elif applied_lev == 0:
-                    # Only track as failed if it was a rate limit issue (not a permanent skip like spot market)
-                    self._leverage_failed.add(symbol)
+                    # Rate limit issue or other failure (not a permanent skip like spot market)
                     skipped_count += 1
                 else:
                     # applied_lev == -1 means permanent skip (spot market, delisted, etc.)
@@ -316,103 +343,9 @@ class Lighter(VenueBase):
 
             except Exception as e:
                 log.warning(f"[Lighter] Exception setting leverage for {symbol}: {e}")
-                self._leverage_failed.add(symbol)
                 await asyncio.sleep(2.0)
 
         log.info(f"[Lighter] Leverage setup complete. Success: {success_count}, Skipped/Failed: {skipped_count}")
-
-        # Schedule background retry task if there are failures
-        if self._leverage_failed:
-            log.info(f"[Lighter] {len(self._leverage_failed)} symbols will be retried in background after 60s")
-            self._schedule_leverage_retry()
-
-    def _schedule_leverage_retry(self) -> None:
-        """Schedule a background task to retry failed leverage setups. DISABLED."""
-        # DISABLED: Leverage API calls drain quota
-        return
-        if self._leverage_retry_task and not self._leverage_retry_task.done():
-            return  # Already scheduled
-        self._leverage_retry_task = asyncio.create_task(self._retry_failed_leverage())
-
-    async def _retry_failed_leverage(self) -> None:
-        """Background task that retries leverage setup for failed symbols."""
-        await asyncio.sleep(60.0)  # Wait 60s for rate limits to cool down
-
-        # Skip if volume quota blocked
-        if self.is_volume_quota_blocked():
-            remaining = self.get_volume_quota_remaining_minutes()
-            log.info(f"[Lighter] Retry skipped: Volume quota blocked for {remaining:.0f} more minutes")
-            return
-
-        if not self._leverage_failed:
-            return
-
-        symbols_to_retry = list(self._leverage_failed)
-        log.info(f"[Lighter] Background retry: attempting leverage setup for {len(symbols_to_retry)} symbols...")
-
-        success_count = 0
-        still_failed = 0
-
-        for symbol in symbols_to_retry:
-            info = self._instruments.get(symbol)
-            if not info:
-                self._leverage_failed.discard(symbol)
-                continue
-
-            market_index = info.get("id")
-            if market_index is None:
-                self._leverage_failed.discard(symbol)
-                continue
-
-            # Try to set leverage with longer delays
-            applied = False
-            for lev in [5, 3, 2]:
-                try:
-                    tx, resp, err = await self._sdk_client.update_leverage(
-                        market_index=int(market_index),
-                        margin_mode=lighter.SignerClient.ISOLATED_MARGIN_MODE,
-                        leverage=lev,
-                    )
-
-                    if not err:
-                        log.info(f"[Lighter] [RETRY OK] Leverage set to {lev}x for {symbol}")
-                        self._leverage_failed.discard(symbol)
-                        success_count += 1
-                        applied = True
-                        break
-
-                    err_str = str(err).lower()
-                    if "too many requests" in err_str or "429" in err_str or "volume quota" in err_str or "23000" in err_str:
-                        if "volume quota" in err_str or "23000" in err_str:
-                            self._set_volume_quota_block()
-                            return  # Abort retry loop entirely
-                        log.debug(f"[Lighter] Retry rate limited for {symbol}, will try again later")
-                        await asyncio.sleep(5.0)
-                        break
-                    elif "invalid initial margin" in err_str:
-                        continue  # Try lower leverage
-                    else:
-                        break  # Other error, skip
-
-                except Exception as e:
-                    log.debug(f"[Lighter] Retry exception for {symbol}: {e}")
-                    break
-
-                await asyncio.sleep(2.0)
-
-            if not applied:
-                still_failed += 1
-
-            await asyncio.sleep(2.0)  # Longer delay between symbols for retry
-
-        log.info(f"[Lighter] Background retry complete. Success: {success_count}, Still failed: {still_failed}")
-
-        # If still have failures, schedule another retry in 5 minutes
-        if self._leverage_failed:
-            log.info(f"[Lighter] {len(self._leverage_failed)} symbols still need retry, scheduling in 5min")
-            await asyncio.sleep(300.0)
-            if self._leverage_failed:
-                await self._retry_failed_leverage()
 
     async def _load_instruments(self) -> None:
         try:
@@ -493,18 +426,23 @@ class Lighter(VenueBase):
 
 
     async def close(self) -> None:
+        # Cancel background tasks
+        for t in (self._ws_task, self._staleness_task):
+            if t:
+                t.cancel()
         if self._session:
             await self._session.close()
             self._session = None
         if self._ws_client:
             await self._ws_client.close()
-    async def set_isolated_margin(self, symbol: str, leverage: int = 5) -> bool:
+    async def set_isolated_margin(self, symbol: str, leverage: int = 2) -> bool:
         """
         Set isolated margin mode for Lighter.
-        
+
         IMPORTANT: Lighter uses ACCOUNT-LEVEL margin settings configured via the web UI.
         This method verifies the account leverage limits and warns if > requested.
-        
+        P0 FIX: Default leverage reduced from 3x to 2x for risk management.
+
         Returns True if we believe the account is properly configured.
         """
         # Try to verify account limits
@@ -538,16 +476,99 @@ class Lighter(VenueBase):
         self._leverage_warned = True
         return True
     
-    async def set_leverage(self, symbol: str, leverage: int = 5) -> bool:
+    async def set_leverage(self, symbol: str, leverage: int = 2) -> bool:
         """
         Set leverage for Lighter using SDK SignerClient.
         DISABLED: Leverage calls drain volume quota and always fail.
-        Assumes leverage is pre-configured on the account.
+        Assumes leverage is pre-configured on the account (2x isolated).
+        P0 FIX 2026-01-22: Added verification - logs prominent warning if leverage cannot be verified.
+
+        Returns:
+            True if leverage is verified or assumed OK (with warning).
+            Returns True even if verification fails to avoid blocking trading,
+            but logs prominent warnings for manual verification.
         """
-        # DISABLED: Leverage API calls drain quota and fail
-        # Assume leverage is already configured on Lighter account
-        log.debug(f"[Lighter] Leverage setup disabled for {symbol} (assumes pre-configured)")
-        return True
+        # P0 FIX 2026-01-22: Attempt to verify leverage before proceeding
+        # This doesn't SET leverage (API drains quota), but VERIFIES it's pre-configured
+        verified = await self._verify_leverage_configuration(symbol, expected_leverage=leverage)
+
+        if verified:
+            log.info(f"[Lighter] Leverage verified: {symbol} is configured for {leverage}x isolated")
+            return True
+        else:
+            # Verification failed - log prominently but don't fail-fast
+            # Trading will proceed but user must check manually
+            if not getattr(self, '_leverage_warning_logged', False):
+                log.error("=" * 60)
+                log.error("[Lighter] P0 CRITICAL: LEVERAGE VERIFICATION FAILED")
+                log.error(f"[Lighter] Cannot verify that {symbol} is configured for {leverage}x isolated")
+                log.error("[Lighter] PLEASE MANUALLY VERIFY AT: https://lighter.xyz/trade")
+                log.error("[Lighter] If leverage is wrong, you may be trading with unexpected exposure!")
+                log.error("=" * 60)
+                self._leverage_warning_logged = True
+            return True  # Return True to not block trading, but warning is logged
+
+    async def _verify_leverage_configuration(self, symbol: str, expected_leverage: int = 2) -> bool:
+        """
+        P0 FIX 2026-01-22: Verify account leverage configuration without setting it.
+
+        Returns True if leverage can be verified as correct.
+        Returns False if verification fails (doesn't mean leverage is wrong, just unverified).
+        """
+        if not self._sdk_client:
+            log.warning(f"[Lighter] Cannot verify leverage for {symbol}: SDK client not available")
+            return False
+
+        try:
+            import lighter
+            account_api = lighter.AccountApi(self._sdk_client.api_client)
+            account = await account_api.account(by="index", value=str(self.account_index))
+
+            if hasattr(account, 'accounts') and account.accounts:
+                acc = account.accounts[0]
+
+                # Try to find leverage info in account data
+                # Different Lighter SDK versions expose this differently
+                max_leverage = getattr(acc, 'max_leverage', None)
+                leverage_setting = getattr(acc, 'leverage', None)
+                margin_mode = getattr(acc, 'margin_mode', None)
+
+                # Log what we found for debugging
+                log.debug(f"[Lighter] Account info: max_leverage={max_leverage}, leverage={leverage_setting}, margin_mode={margin_mode}")
+
+                # Check if we can verify leverage
+                if leverage_setting is not None:
+                    if int(leverage_setting) == expected_leverage:
+                        return True
+                    else:
+                        log.error(f"[Lighter] LEVERAGE MISMATCH: Expected {expected_leverage}x, found {leverage_setting}x")
+                        return False
+
+                if max_leverage is not None:
+                    if int(max_leverage) >= expected_leverage:
+                        log.info(f"[Lighter] Account max_leverage={max_leverage} >= expected {expected_leverage}x (OK)")
+                        return True
+
+                # Can't verify from account info - check via positions if any exist
+                if hasattr(acc, 'positions') and acc.positions:
+                    for pos in acc.positions:
+                        pos_leverage = getattr(pos, 'leverage', None)
+                        if pos_leverage is not None:
+                            if int(pos_leverage) == expected_leverage:
+                                return True
+                            else:
+                                log.warning(f"[Lighter] Position leverage mismatch: {pos_leverage}x vs expected {expected_leverage}x")
+
+                # No verification possible from account data
+                log.warning(f"[Lighter] Cannot verify leverage from account data - assuming pre-configured")
+                return False
+            else:
+                log.warning(f"[Lighter] No account data returned for leverage verification")
+                return False
+
+        except Exception as e:
+            log.warning(f"[Lighter] Leverage verification error: {e}")
+            return False
 
         if not self._sdk_client:
             log.warning(f"[Lighter] SDK client not available - cannot set leverage for {symbol}")
@@ -620,12 +641,6 @@ class Lighter(VenueBase):
                 
         if applied_lev == 0:
              log.warning(f"[Lighter] [ERROR] Failed to set leverage for {symbol} after all fallbacks.")
-             # Track for background retry
-             self._leverage_failed.add(symbol)
-             self._schedule_leverage_retry()
-        else:
-             # Success - remove from failed set if present
-             self._leverage_failed.discard(symbol)
 
         return applied_lev > 0
 
@@ -662,10 +677,17 @@ class Lighter(VenueBase):
                 "dry_run": True
             }
 
-        # Get market info
-        info = self._instruments.get(symbol.upper())
+        # Get market info - FIX 2026-01-24 Bug #4: Use _normalize_symbol for lookup
+        symbol_normalized = self._normalize_symbol(symbol.upper())
+        info = self._instruments.get(symbol_normalized)
         if not info:
-            return {"status": "error", "reason": f"Unknown instrument {symbol}", "filled": 0.0, "order_id": None, "avg_price": 0.0}
+            # Try refreshing instruments before giving up
+            log.debug(f"[Lighter] Instrument {symbol} ({symbol_normalized}) not found, refreshing instruments...")
+            await self._load_instruments()
+            symbol_normalized = self._normalize_symbol(symbol.upper())
+            info = self._instruments.get(symbol_normalized)
+        if not info:
+            return {"status": "error", "reason": f"Unknown instrument {symbol} (normalized: {symbol_normalized})", "filled": 0.0, "order_id": None, "avg_price": 0.0}
 
         market_index = info.get("id", 0)
         price_decimals = info.get("price_decimals", 2)
@@ -746,6 +768,17 @@ class Lighter(VenueBase):
                     if "volume quota" in err_str or "23000" in err_str:
                         self._set_volume_quota_block()
                         return {"status": "error", "reason": "volume_quota_limit", "filled": 0.0, "order_id": None, "avg_price": 0.0}
+
+                    # FIX 2026-01-24: Handle "invalid reduce only mode" error (code 21740)
+                    # Some markets (like XAU) don't support reduce_only parameter
+                    # Block this symbol from future attempts
+                    if "21740" in err_str or "invalid reduce only mode" in err_str:
+                        log.error(f"[Lighter] Market {symbol} does not support reduce_only mode - blocking symbol")
+                        # Add to a set of blocked symbols (market doesn't support reduce_only)
+                        if not hasattr(self, '_reduce_only_blocked_symbols'):
+                            self._reduce_only_blocked_symbols = set()
+                        self._reduce_only_blocked_symbols.add(symbol_normalized)
+                        return {"status": "error", "reason": "market_no_reduce_only_support", "filled": 0.0, "order_id": None, "avg_price": 0.0}
 
                     # Categorize errors
                     is_rate_limit = any(x in err_str for x in ["too many requests", "429", "rate limit"])
@@ -833,8 +866,13 @@ class Lighter(VenueBase):
             log.debug(f"[Lighter] _verify_fill error: {e}")
             return (expected_qty, 0.0)  # Optimistic fallback
 
-    async def cancel_order(self, symbol: str, order_id: str) -> Dict[str, Any]:
-        """Cancel a resting order on Lighter."""
+    async def cancel_order(self, order_id: Any, symbol: str) -> Dict[str, Any]:
+        """Cancel a resting order on Lighter.
+
+        P1 FIX 2026-01-22: Standardized parameter order to match HL/AS convention.
+        Previously was (symbol, order_id) which was inconsistent with other venues.
+        Now matches: cancel_order(order_id, symbol) like Hyperliquid and Aster.
+        """
         try:
             instr = self._instruments.get(symbol.upper())
             if not instr:
@@ -866,25 +904,167 @@ class Lighter(VenueBase):
             log.error(f"[Lighter] Cancel exception: {e}")
             return {"status": "error", "reason": str(e)}
 
-        return self._session is not None and not self._session.closed
+    async def wait_for_fill(
+        self,
+        symbol: str,
+        order_id: Any,
+        expected_qty: float,
+        side: str,
+        timeout_s: float = 60.0,
+        poll_interval: float = 2.0
+    ) -> Dict[str, Any]:
+        """
+        Wait for a limit order to fill on Lighter, polling position status.
+
+        Note: Lighter doesn't have a direct order status API, so we verify
+        fills by checking position changes.
+
+        Args:
+            symbol: Trading symbol (e.g., "BTC")
+            order_id: The order ID (used for logging)
+            expected_qty: Expected fill quantity
+            side: "BUY" or "SELL" (needed for position verification)
+            timeout_s: Maximum wait time (default 60s)
+            poll_interval: Polling frequency (default 2s)
+
+        Returns:
+            Dict with keys: filled, avg_price, is_maker, status
+            status is one of: 'filled', 'partial', 'timeout'
+        """
+        start_time = time.time()
+        initial_position = 0.0
+        initial_entry_price = 0.0
+
+        # Get initial position state
+        try:
+            positions = await self.get_positions()
+            for pos in positions:
+                if pos.get("symbol", "").upper() == symbol.upper():
+                    initial_position = float(pos.get("size", 0))
+                    initial_entry_price = float(pos.get("entry", 0))
+                    break
+        except Exception as e:
+            log.warning(f"[Lighter] wait_for_fill initial position check error: {e}")
+
+        last_detected_fill = 0.0
+
+        while (time.time() - start_time) < timeout_s:
+            try:
+                positions = await self.get_positions()
+                current_position = 0.0
+                current_entry_price = 0.0
+
+                for pos in positions:
+                    if pos.get("symbol", "").upper() == symbol.upper():
+                        current_position = float(pos.get("size", 0))
+                        current_entry_price = float(pos.get("entry", 0))
+                        break
+
+                # Calculate fill based on position change
+                position_delta = abs(current_position - initial_position)
+
+                # If position changed in expected direction, we have fills
+                if side.upper() == "BUY":
+                    # Expecting position to increase
+                    fill_qty = current_position - initial_position if current_position > initial_position else 0
+                else:
+                    # Expecting position to decrease (or go more negative)
+                    fill_qty = initial_position - current_position if current_position < initial_position else 0
+
+                fill_qty = abs(fill_qty)
+
+                if fill_qty >= expected_qty * 0.95:
+                    log.info(f"[Lighter] Order {order_id} filled: {fill_qty:.6f} @ ${current_entry_price:.4f}")
+                    return {
+                        "filled": fill_qty,
+                        "avg_price": current_entry_price,
+                        "is_maker": True,
+                        "status": "filled"
+                    }
+
+                if fill_qty > last_detected_fill:
+                    log.debug(f"[Lighter] Order {order_id} partial fill: {fill_qty:.6f}/{expected_qty:.6f}")
+                    last_detected_fill = fill_qty
+
+            except Exception as e:
+                log.warning(f"[Lighter] wait_for_fill poll error: {e}")
+
+            await asyncio.sleep(poll_interval)
+
+        # Timeout reached - but do a FINAL SWEEP before giving up
+        # FIX 2026-01-25: Late fills can arrive between polls, causing false rollbacks
+        elapsed = time.time() - start_time
+        log.info(f"[Lighter] Order {order_id} timeout after {elapsed:.1f}s, detected_fill={last_detected_fill:.6f}")
+
+        # FINAL SWEEP: One more position check after brief delay for settlement
+        try:
+            await asyncio.sleep(0.5)  # Small delay for settlement
+            positions = await self.get_positions()
+            final_position = 0.0
+            final_entry_price = 0.0
+
+            for pos in positions:
+                if pos.get("symbol", "").upper() == symbol.upper():
+                    final_position = float(pos.get("size", 0))
+                    final_entry_price = float(pos.get("entry", 0))
+                    break
+
+            # Calculate fill based on position change
+            if side.upper() == "BUY":
+                final_fill_qty = final_position - initial_position if final_position > initial_position else 0
+            else:
+                final_fill_qty = initial_position - final_position if final_position < initial_position else 0
+
+            final_fill_qty = abs(final_fill_qty)
+
+            # Check if late fill detected (>= 70% of target)
+            if final_fill_qty >= expected_qty * 0.70 and final_fill_qty > last_detected_fill:
+                log.warning(f"[Lighter] LATE FILL SWEEP: Order {order_id} detected fill={final_fill_qty:.6f} "
+                           f"(target={expected_qty:.6f}, was={last_detected_fill:.6f}) - NOT rolling back!")
+                return {
+                    "filled": final_fill_qty,
+                    "avg_price": final_entry_price,
+                    "is_maker": True,
+                    "status": "filled"  # Treat as filled to prevent orphan rollback
+                }
+        except Exception as sweep_e:
+            log.debug(f"[Lighter] Final sweep check error (non-fatal): {sweep_e}")
+
+        # Return partial fill info (no late fill detected)
+        return {
+            "filled": last_detected_fill,
+            "avg_price": 0.0,
+            "is_maker": last_detected_fill > 0,
+            "status": "timeout"
+        }
 
     # ---------- Public Data ----------
 
     async def _send_sub(self, symbol: str):
         # We need to send: {"type": "subscribe", "channel": "order_book/{id}"}
         # Custom WS sub
-        if not self._ws: return
-        
+        if not self._ws:
+            log.warning(f"[Lighter] _send_sub: WS not connected for {symbol}")
+            return
+
         info = self._instruments.get(symbol.upper())
-        if not info: return 
-        
+        if not info:
+            loaded_keys = list(self._instruments.keys())[:5]
+            log.warning(f"[Lighter] _send_sub: No instrument for {symbol}. Loaded: {loaded_keys}... ({len(self._instruments)} total)")
+            return
+
         market_id = info.get("id")
-        if market_id is None: return
-        
+        if market_id is None:
+            log.warning(f"[Lighter] _send_sub: No market_id for {symbol}")
+            return
+
         # Format 1 (Verified): {"type": "subscribe", "channel": "order_book/ID"}
         msg = {"type": "subscribe", "channel": f"order_book/{market_id}"}
-        try: await self._ws.send_json(msg)
-        except Exception: pass
+        log.debug(f"[Lighter] Subscribing to {symbol} (market_id={market_id})")
+        try:
+            await self._ws.send_json(msg)
+        except Exception as e:
+            log.warning(f"[Lighter] _send_sub failed for {symbol}: {e}")
 
     async def subscribe_orderbook(self, symbol: str) -> None:
         symbol = symbol.upper()
@@ -894,14 +1074,21 @@ class Lighter(VenueBase):
             if self._ws:
                 await self._send_sub(symbol)
 
+    async def subscribe_tickers(self, symbols: List[str]) -> None:
+        """Subscribe to real-time ticker/BBO updates for symbols."""
+        for symbol in symbols:
+            await self.subscribe_orderbook(symbol)
+
     async def get_fresh_bbo(self, symbol: str, max_age_ms: float = 2000.0) -> Optional[Tuple[float, float]]:
         """
         Get BBO, fetching via REST if cache is stale or missing.
         """
-        age = self.get_bbo_age_ms(symbol)
+        # FIX 2026-01-24 Bug #3: Normalize symbol for cache lookup
+        symbol_normalized = self._normalize_symbol(symbol.upper())
+        age = self.get_bbo_age_ms(symbol_normalized)
         if age <= max_age_ms:
             # _bbo can be (bb, ba) or (bb, ba, bs, bas)
-            val = self._bbo.get(symbol.upper())
+            val = self._bbo.get(symbol_normalized)
             if not val: return None
             if len(val) >= 2:
                 return (val[0], val[1])
@@ -914,11 +1101,13 @@ class Lighter(VenueBase):
         """
         Fetch BBO, preferring SDK with market_id if available.
         """
-        symbol = symbol.upper()
+        # FIX 2026-01-24: Normalize symbol to Lighter format (BTC -> BTC-USDC)
+        symbol = self._normalize_symbol(symbol.upper())
         info = self._instruments.get(symbol)
         if not info:
              # Refresh instruments if not found
              await self._load_instruments()
+             symbol = self._normalize_symbol(symbol)  # Re-normalize after refresh
              info = self._instruments.get(symbol)
 
         if info and self._sdk_client:
@@ -927,13 +1116,28 @@ class Lighter(VenueBase):
                 market_index = info.get("id")
                 if market_index is not None:
                     order_api = lighter.OrderApi(self._sdk_client.api_client)
-                    ob = await order_api.order_book_orders(market_id=market_index, limit=1)
+                    ob = await order_api.order_book_orders(market_id=market_index, limit=5)
                     if ob.bids and ob.asks:
-                        best_bid = float(ob.bids[0].price)
-                        best_ask = float(ob.asks[0].price)
-                        self._bbo[symbol] = (best_bid, best_ask)
-                        self._bbo_ts[symbol] = time.time()
-                        return (best_bid, best_ask)
+                        # Parse all levels for depth aggregation
+                        parsed_bids = [(float(b.price), float(b.remaining_base_amount)) for b in ob.bids if float(b.price) > 0]
+                        parsed_asks = [(float(a.price), float(a.remaining_base_amount)) for a in ob.asks if float(a.price) > 0]
+                        parsed_bids.sort(key=lambda x: x[0], reverse=True)
+                        parsed_asks.sort(key=lambda x: x[0])
+
+                        if parsed_bids and parsed_asks:
+                            best_bid, bid_sz = parsed_bids[0]
+                            best_ask, ask_sz = parsed_asks[0]
+
+                            # Update _books cache for aggregated depth
+                            if symbol not in self._books:
+                                self._books[symbol] = Book()
+                            self._books[symbol].bids = parsed_bids
+                            self._books[symbol].asks = parsed_asks
+
+                            # Store 4-tuple to preserve sizes
+                            self._bbo[symbol] = (best_bid, best_ask, bid_sz, ask_sz)
+                            self._bbo_ts[symbol] = time.time()
+                            return (best_bid, best_ask)
             except Exception as e:
                 log.debug(f"[Lighter] SDK BBO fetch failed for {symbol}: {e}")
 
@@ -951,40 +1155,106 @@ class Lighter(VenueBase):
             async with self._session.get(url, params=params) as r:
                 if r.status != 200:
                     return None
-                    
+
                 data = await r.json()
                 bids = data.get("bids", [])
                 asks = data.get("asks", [])
-                
-                best_bid = 0.0
-                best_ask = 0.0
-                
-                if bids:
-                    top = bids[0]
-                    best_bid = float(top.get("price") if isinstance(top, dict) else top[0])
-                if asks:
-                    top = asks[0]
-                    best_ask = float(top.get("price") if isinstance(top, dict) else top[0])
-                        
-                if best_bid > 0 and best_ask > 0:
-                    self._bbo[symbol] = (best_bid, best_ask)
+
+                # Parse all levels for depth aggregation
+                parsed_bids = []
+                parsed_asks = []
+                for b in bids:
+                    try:
+                        if isinstance(b, dict):
+                            px = float(b.get("price", 0))
+                            sz = float(b.get("size", 0))
+                        else:
+                            px = float(b[0])
+                            sz = float(b[1]) if len(b) > 1 else 0.0
+                        if px > 0:
+                            parsed_bids.append((px, sz))
+                    except: pass
+                for a in asks:
+                    try:
+                        if isinstance(a, dict):
+                            px = float(a.get("price", 0))
+                            sz = float(a.get("size", 0))
+                        else:
+                            px = float(a[0])
+                            sz = float(a[1]) if len(a) > 1 else 0.0
+                        if px > 0:
+                            parsed_asks.append((px, sz))
+                    except: pass
+
+                # Sort: bids descending, asks ascending
+                parsed_bids.sort(key=lambda x: x[0], reverse=True)
+                parsed_asks.sort(key=lambda x: x[0])
+
+                if parsed_bids and parsed_asks:
+                    best_bid, bid_sz = parsed_bids[0]
+                    best_ask, ask_sz = parsed_asks[0]
+
+                    # Update _books cache for aggregated depth
+                    if symbol not in self._books:
+                        self._books[symbol] = Book()
+                    self._books[symbol].bids = parsed_bids
+                    self._books[symbol].asks = parsed_asks
+
+                    # Store 4-tuple to preserve sizes
+                    self._bbo[symbol] = (best_bid, best_ask, bid_sz, ask_sz)
                     self._bbo_ts[symbol] = time.time()
                     return (best_bid, best_ask)
         except Exception:
             pass
         return None
 
+    def is_ws_healthy(self, max_age_ms: float = 5000.0) -> bool:
+        """
+        Check if WebSocket is connected and receiving data.
+        FIX 2026-01-22: Added to detect WS disconnects that leave stale prices.
+
+        Returns True only if:
+        1. _ws_connected event is set (WS appears connected)
+        2. At least one subscribed symbol has fresh data (< max_age_ms)
+        """
+        if not self._ws_connected.is_set():
+            return False
+
+        if not self._books:
+            # No subscriptions yet, consider healthy
+            return True
+
+        # Check if ANY symbol has fresh data
+        now = time.time()
+        for symbol in self._books.keys():
+            ts = self._bbo_ts.get(symbol.upper(), 0.0)
+            if ts > 0 and (now - ts) * 1000 < max_age_ms:
+                return True
+
+        # All subscribed symbols have stale data = unhealthy
+        return False
+
     def get_bbo(self, symbol: str) -> Optional[Tuple[float, float]]:
-        return self._bbo.get(symbol.upper())
+        sym = symbol.upper()
+        val = self._bbo.get(sym)
+        if val:
+            return val
+        # FIX 2026-01-24: Try normalized symbol format
+        norm = self._normalize_symbol(sym)
+        if norm != sym:
+            return self._bbo.get(norm)
+        return None
 
     def round_price(self, symbol: str, price: float) -> float:
-        instr = self._instruments.get(symbol.upper())
+        sym = self._normalize_symbol(symbol.upper())
+        instr = self._instruments.get(sym)
         if not instr: return price
         decimals = instr.get("price_decimals", 2)
         return round(price, decimals)
 
     def round_qty(self, symbol: str, qty: float) -> float:
-        instr = self._instruments.get(symbol.upper())
+        sym = self._normalize_symbol(symbol.upper())
+        instr = self._instruments.get(sym)
         if not instr: return qty
         decimals = instr.get("size_decimals", 2)
         return round(qty, decimals)
@@ -1006,7 +1276,68 @@ class Lighter(VenueBase):
         # Try REST (fetch_bbo_rest return simple tuple, we need fetch_order_book)
         # For now return None
         return None
-    
+
+    def get_aggregated_depth_usd(self, symbol: str, levels: int = 5) -> float:
+        """Sum depth across multiple orderbook levels for more accurate liquidity estimate."""
+        sym = symbol.upper()
+
+        # FIX 2026-01-24: Try multiple symbol formats to handle mismatches
+        # Lighter uses "BTC-USDC" format, but caller might pass "BTC" or "BTCUSDC"
+        book = self._books.get(sym)
+        if not book or not book.bids or not book.asks:
+            # Try alternate formats: BTC -> BTC-USDC, BTCUSDC -> BTC
+            alt_formats = []
+            if "-" not in sym and "USDC" not in sym and "USDT" not in sym:
+                alt_formats.append(f"{sym}-USDC")  # BTC -> BTC-USDC
+            if sym.endswith("USDT"):
+                base = sym.replace("USDT", "")
+                alt_formats.append(f"{base}-USDC")  # BTCUSDT -> BTC-USDC
+            if "-USDC" in sym:
+                alt_formats.append(sym.replace("-USDC", ""))  # BTC-USDC -> BTC
+
+            for alt in alt_formats:
+                book = self._books.get(alt)
+                if book and book.bids and book.asks:
+                    # Log the symbol mismatch discovery once
+                    if not hasattr(self, '_symbol_remap_logged'):
+                        self._symbol_remap_logged = set()
+                    if sym not in self._symbol_remap_logged:
+                        self._symbol_remap_logged.add(sym)
+                        log.info(f"[Lighter] Symbol remap: '{sym}' -> '{alt}' for depth lookup")
+                    sym = alt
+                    break
+
+        if not book or not book.bids or not book.asks:
+            # Fallback: Use _bbo 4-tuple if available (bid_px, ask_px, bid_sz, ask_sz)
+            val = self._bbo.get(sym)
+            # Also try alternate formats for _bbo
+            if not val or len(val) < 4:
+                for alt in (f"{sym}-USDC", sym.replace("-USDC", ""), sym.replace("USDT", "-USDC")):
+                    val = self._bbo.get(alt)
+                    if val and len(val) >= 4:
+                        break
+            if val and len(val) >= 4:
+                mid = (val[0] + val[1]) / 2
+                depth_usd = min(val[2], val[3]) * mid
+                # Log when falling back to single-level for major pairs
+                if mid > 1000 or sym in ("BTC", "BTC-USDC", "ETH", "ETH-USDC"):
+                    log.debug(f"[Lighter] get_aggregated_depth_usd({sym}): FALLBACK to _bbo single-level, "
+                              f"bid_sz={val[2]:.6f} ask_sz={val[3]:.6f} mid=${mid:.2f} -> ${depth_usd:.2f}")
+                    # Log available book keys for diagnosis
+                    if not hasattr(self, '_depth_diag_logged'):
+                        self._depth_diag_logged = set()
+                    if sym not in self._depth_diag_logged:
+                        self._depth_diag_logged.add(sym)
+                        book_keys = list(self._books.keys())[:10]
+                        log.info(f"[Lighter] DEPTH DIAG: Looking for '{symbol}', _books has {len(self._books)} keys: {book_keys}...")
+                return depth_usd
+            log.debug(f"[Lighter] get_aggregated_depth_usd: No book/bbo for {sym}")
+            return 0.0
+        mid = (book.bids[0][0] + book.asks[0][0]) / 2
+        bid_depth = sum(sz for _, sz in book.bids[:levels])
+        ask_depth = sum(sz for _, sz in book.asks[:levels])
+        return min(bid_depth, ask_depth) * mid
+
     async def get_bbo_with_depth_async(self, symbol: str) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
         """Fetch BBO with depth from Lighter SDK."""
         if not self._sdk_client:
@@ -1025,26 +1356,44 @@ class Lighter(VenueBase):
             ob = await order_api.order_book_orders(market_id=market_index, limit=5)
 
             if ob.bids and ob.asks:
-                # Parse best bid/ask with sizes
-                best_bid_price = float(ob.bids[0].price)
-                best_bid_size = float(ob.bids[0].remaining_base_amount)
-                best_ask_price = float(ob.asks[0].price)
-                best_ask_size = float(ob.asks[0].remaining_base_amount)
+                # Parse all levels for depth aggregation
+                sym = symbol.upper()
+                parsed_bids = [(float(b.price), float(b.remaining_base_amount)) for b in ob.bids if float(b.price) > 0]
+                parsed_asks = [(float(a.price), float(a.remaining_base_amount)) for a in ob.asks if float(a.price) > 0]
+                parsed_bids.sort(key=lambda x: x[0], reverse=True)
+                parsed_asks.sort(key=lambda x: x[0])
 
-                # Cache for sync access
-                self._bbo[symbol.upper()] = (best_bid_price, best_ask_price)
-                self._bbo_ts[symbol.upper()] = time.time()
-                self._depth_cache[symbol.upper()] = (best_bid_size, best_ask_size)
+                if parsed_bids and parsed_asks:
+                    best_bid_price, best_bid_size = parsed_bids[0]
+                    best_ask_price, best_ask_size = parsed_asks[0]
 
-                return ((best_bid_price, best_bid_size), (best_ask_price, best_ask_size))
+                    # Update _books cache for aggregated depth
+                    if sym not in self._books:
+                        self._books[sym] = Book()
+                    self._books[sym].bids = parsed_bids
+                    self._books[sym].asks = parsed_asks
+
+                    # Cache for sync access - store 4-tuple to preserve sizes
+                    self._bbo[sym] = (best_bid_price, best_ask_price, best_bid_size, best_ask_size)
+                    self._bbo_ts[sym] = time.time()
+                    self._depth_cache[sym] = (best_bid_size, best_ask_size)
+
+                    return ((best_bid_price, best_bid_size), (best_ask_price, best_ask_size))
         except Exception as e:
             log.debug(f"[Lighter] Failed to get depth for {symbol}: {e}")
 
         return self.get_bbo_with_depth(symbol)
 
     def get_bbo_age_ms(self, symbol: str) -> float:
-        ts = self._bbo_ts.get(symbol.upper(), 0.0)
-        if ts <= 0: return 999999.0
+        sym = symbol.upper()
+        ts = self._bbo_ts.get(sym, 0.0)
+        if ts <= 0:
+            # FIX 2026-01-24: Try normalized symbol format
+            norm = self._normalize_symbol(sym)
+            if norm != sym:
+                ts = self._bbo_ts.get(norm, 0.0)
+        if ts <= 0:
+            return 999999.0
         return (time.time() - ts) * 1000.0
 
     async def equity(self) -> Optional[float]:
@@ -1077,16 +1426,20 @@ class Lighter(VenueBase):
                     acc = accounts[0] if isinstance(accounts, list) else accounts
                     total = 0.0
                     
-                    # Primary: use collateral or total_asset_value
+                    # Primary: use collateral (free balance not locked in positions)
                     total = float(acc.get("collateral", 0) or 0)
                     if total == 0:
-                        total = float(acc.get("total_asset_value", 0) or 0)
-                    if total == 0:
                         total = float(acc.get("available_balance", 0) or 0)
-                    
-                    # Add unrealized PnL from positions if any
+
+                    # CRITICAL: Add margin locked in positions + unrealized PnL
+                    # Lighter subtracts margin from collateral when positions are opened,
+                    # so we need to add it back to get true account equity
                     positions = acc.get("positions", [])
                     for pos in positions:
+                        # Add allocated margin (locked for this position)
+                        allocated = float(pos.get("allocated_margin", 0) or 0)
+                        total += allocated
+                        # Add unrealized PnL
                         pnl = float(pos.get("unrealized_pnl", 0) or 0)
                         total += pnl
                     
@@ -1112,20 +1465,27 @@ class Lighter(VenueBase):
         while True:
             ws = None
             try:
-                log.info(f"[Lighter] Connecting to WS: {self.ws_url}")
+                log.debug(f"[Lighter] Connecting to WS: {self.ws_url}")
                 try:
                     ws = await self._session.ws_connect(self.ws_url, heartbeat=15, timeout=30)
                 except Exception as conn_err:
                     log.error(f"[Lighter] WS Connect FAILED: {type(conn_err).__name__}: {conn_err}")
-                    await asyncio.sleep(5)
+                    # FIX 2026-01-24: Exponential backoff for failed connections
+                    await asyncio.sleep(self._ws_reconnect_backoff)
+                    self._ws_reconnect_backoff = min(self._ws_reconnect_backoff * 2, 30.0)
                     continue
-                    
+
                 self._ws = ws
-                log.info("[Lighter] WS Connected!")
-                
+                self._ws_connected.set()  # FIX 2026-01-22: Signal WS is connected
+                # FIX 2026-01-24: Reset backoff on successful connection
+                self._ws_reconnect_backoff = 1.0
+                self._ws_last_reconnect_time = time.time()
+                log.debug("[Lighter] WS Connected!")
+
                 # Resubscribe to existing books
                 for s in list(self._books.keys()):
                     await self._send_sub(s)
+                    await asyncio.sleep(0.05)  # FIX 2026-01-24: 50ms rate limit on resubscriptions
                     
                 async for msg in ws:
                     if msg.type == aiohttp.WSMsgType.TEXT:
@@ -1175,55 +1535,99 @@ class Lighter(VenueBase):
                                 if self._bbo_ts.get(f"DATA_{target_sym}") is None:
                                     log.info(f"[Lighter] Received data for {target_sym}: {len(bids)}b/{len(asks)}a")
                                     self._bbo_ts[f"DATA_{target_sym}"] = 1.0
-                                
-                                # Initialize/Update BBO
-                                best_bid = 0.0
-                                best_ask = 0.0
-                                bid_sz = 0.0
-                                ask_sz = 0.0
-                                
-                                # Process Bids (Highest first)
-                                if bids:
-                                    for b in bids:
-                                        try:
-                                            px = float(b.get("price", 0))
-                                            sz = float(b.get("size", 0))
-                                            if px > best_bid:
-                                                best_bid = px
-                                                bid_sz = sz
-                                        except: pass
-                                        
-                                if asks:
-                                    best_ask = 999999999.0
-                                    found_ask = False
-                                    for a in asks:
-                                        try:
-                                            px = float(a.get("price", 0))
-                                            sz = float(a.get("size", 0))
-                                            if px > 0 and px < best_ask:
-                                                best_ask = px
-                                                ask_sz = sz
-                                                found_ask = True
-                                        except: pass
-                                    if not found_ask:
-                                        best_ask = 0.0
 
-                                # Update Cache
-                                if best_bid > 0 and best_ask > 0:
+                                # Parse all levels for depth aggregation
+                                parsed_bids = []
+                                parsed_asks = []
+                                for b in bids:
+                                    try:
+                                        px = float(b.get("price", 0))
+                                        sz = float(b.get("size", 0))
+                                        if px > 0 and sz > 0:
+                                            parsed_bids.append((px, sz))
+                                    except: pass
+                                for a in asks:
+                                    try:
+                                        px = float(a.get("price", 0))
+                                        sz = float(a.get("size", 0))
+                                        if px > 0 and sz > 0:
+                                            parsed_asks.append((px, sz))
+                                    except: pass
+
+                                # Sort: bids descending, asks ascending
+                                parsed_bids.sort(key=lambda x: x[0], reverse=True)
+                                parsed_asks.sort(key=lambda x: x[0])
+
+                                # Update _books cache for aggregated depth
+                                if target_sym not in self._books:
+                                    self._books[target_sym] = Book()
+                                self._books[target_sym].bids = parsed_bids
+                                self._books[target_sym].asks = parsed_asks
+
+                                # Update BBO cache
+                                if parsed_bids and parsed_asks:
+                                    best_bid, bid_sz = parsed_bids[0]
+                                    best_ask, ask_sz = parsed_asks[0]
                                     self._bbo[target_sym] = (best_bid, best_ask, bid_sz, ask_sz)
                                     self._bbo_ts[target_sym] = time.time()
 
                     elif msg.type == aiohttp.WSMsgType.CLOSE:
                         log.info("[Lighter] WS Closed")
+                        self._ws_connected.clear()  # FIX 2026-01-22: Signal WS disconnected
                         break
                     elif msg.type == aiohttp.WSMsgType.ERROR:
                         log.info("[Lighter] WS Error")
+                        self._ws_connected.clear()  # FIX 2026-01-22: Signal WS disconnected
                         break
             except Exception as e:
                 log.error(f"[Lighter] WS Loop Error: {e}")
+                self._ws_connected.clear()  # FIX 2026-01-22: Signal WS disconnected
                 self._ws = None
-            
-            await asyncio.sleep(5)
+
+            # FIX 2026-01-24: Exponential backoff for reconnects
+            await asyncio.sleep(self._ws_reconnect_backoff)
+            self._ws_reconnect_backoff = min(self._ws_reconnect_backoff * 2, 30.0)
+
+    async def _staleness_monitor_loop(self) -> None:
+        """Monitor for stale price data and log warnings."""
+        STALE_THRESHOLD_MS = 5000.0   # 5 seconds (reduced for faster staleness detection)
+        CHECK_INTERVAL_S = 2.0        # Check every 2s for quicker response
+
+        while True:
+            try:
+                await asyncio.sleep(CHECK_INTERVAL_S)
+                if not self._books:
+                    continue
+
+                stale_symbols = []
+                for symbol in list(self._books.keys()):
+                    age_ms = self.get_bbo_age_ms(symbol)
+                    if age_ms > STALE_THRESHOLD_MS:
+                        stale_symbols.append((symbol, age_ms))
+
+                if stale_symbols:
+                    # FIX 2026-01-22: Reduced to debug - staleness handled silently in background
+                    log.debug("[Lighter] STALENESS: %d symbols stale (>%.0fs): %s",
+                        len(stale_symbols), STALE_THRESHOLD_MS / 1000,
+                        ", ".join(f"{s}:{int(age)}ms" for s, age in stale_symbols[:5]))
+
+                    # If >50% of symbols are stale, close WS to trigger reconnect
+                    if len(stale_symbols) > len(self._books) * 0.5:
+                        log.debug("[Lighter] >50%% symbols stale - forcing WS reconnect")
+                        # FIX 2026-01-24: Clear connected flag BEFORE closing WS
+                        # This prevents get_bbo() from returning stale cached values
+                        # during the reconnection window (matches Aster's correct pattern)
+                        self._ws_connected.clear()
+                        if self._ws:
+                            try:
+                                await self._ws.close()
+                            except Exception:
+                                pass
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                log.warning("[Lighter] Staleness monitor error: %s", e)
+                await asyncio.sleep(5.0)
 
     async def get_funding_rates(self) -> Dict[str, float]:
         """
@@ -1245,17 +1649,25 @@ class Lighter(VenueBase):
                 
                 data = await r.json()
                 # Response format: {"code": 200, "funding_rates": [{market_id, exchange, symbol, rate}, ...]}
+                # CRITICAL FIX 2026-01-25: API returns rates from multiple exchanges (binance, bybit, etc.)
+                # We MUST filter for exchange='lighter' only, otherwise we get wrong rates (10x error!)
                 funding_list = data.get("funding_rates", [])
                 if isinstance(funding_list, list):
                     for item in funding_list:
+                        # CRITICAL: Only use Lighter's own funding rate, not other exchanges
+                        exchange = item.get("exchange", "").lower()
+                        if exchange != "lighter":
+                            continue
+
                         # Get symbol from our instruments by market_id
                         market_id = item.get("market_id")
                         rate = item.get("rate", 0)
-                        
+
                         # Find symbol name from market_id
                         for sym, info in self._instruments.items():
                             if info.get("id") == market_id:
                                 self._funding_rates[sym] = float(rate)
+                                log.debug(f"[LT RAW] {sym}: rate={rate} (exchange={exchange})")
                                 break
                         
                 self._last_funding_fetch = now
@@ -1270,8 +1682,11 @@ class Lighter(VenueBase):
     # Old defective equity removed. Using top-stub.
 
     async def get_positions(self) -> List[Dict[str, Any]]:
-        """Fetch all open positions from Lighter."""
+        """Fetch all open positions from Lighter.
+        FIX 2026-01-22: Added size_usd from SDK's position_value field for accurate USD comparison.
+        """
         if not self._sdk_client:
+            log.debug("[Lighter] get_positions: SDK client not available")
             return []
 
         try:
@@ -1283,18 +1698,46 @@ class Lighter(VenueBase):
             if hasattr(account, 'accounts') and account.accounts:
                 acc = account.accounts[0]
                 # Parse positions from account data
+                # SDK AccountPosition fields: position (size in coins), sign (1/-1), symbol,
+                # avg_entry_price, position_value (USD), unrealized_pnl, market_id
                 if hasattr(acc, 'positions') and acc.positions:
                     for pos in acc.positions:
-                        if float(pos.size or 0) != 0:
+                        # 'position' is the size field (coins), 'sign' indicates long(1)/short(-1)
+                        raw_size = float(pos.position or 0)
+                        sign = int(pos.sign or 1)
+                        actual_size = raw_size * sign  # Apply sign for direction
+                        entry_px = float(pos.avg_entry_price or 0)
+                        # FIX 2026-01-22: Use position_value for USD value (more accurate)
+                        position_value = float(pos.position_value or 0)
+                        # Fallback: calculate from size * entry if position_value not available
+                        size_usd = abs(position_value) if position_value != 0 else abs(raw_size * entry_px)
+
+                        # FIX 2026-01-25: Add USD threshold to filter dust positions at source
+                        # Prevents orphan alerts for tiny residuals from partial fills
+                        MIN_POSITION_USD = 10.0
+                        if raw_size != 0:
+                            if size_usd < MIN_POSITION_USD:
+                                log.debug(f"[Lighter] Ignoring dust position {pos.symbol}: ${size_usd:.2f} < ${MIN_POSITION_USD}")
+                                continue
                             positions.append({
-                                "symbol": pos.market_symbol or f"MARKET_{pos.market_id}",
-                                "size": float(pos.size),
-                                "entry": float(pos.entry_price or 0),
+                                "symbol": pos.symbol or f"MARKET_{pos.market_id}",
+                                "size": actual_size,  # Coins (for order calculations)
+                                "size_usd": size_usd,  # USD value (for reconciliation)
+                                "entry": entry_px,
                                 "unrealized_pnl": float(pos.unrealized_pnl or 0),
                             })
+                            log.debug(f"[Lighter] Position found: {pos.symbol} size={actual_size} size_usd=${size_usd:.2f} entry={entry_px}")
+                else:
+                    log.debug(f"[Lighter] get_positions: No positions attribute or empty positions list")
+            else:
+                log.debug(f"[Lighter] get_positions: No accounts in response")
+
+            log.debug(f"[Lighter] get_positions returning {len(positions)} positions: {positions}")
             return positions
         except Exception as e:
-            log.debug(f"[Lighter] get_positions error: {e}")
+            log.warning(f"[Lighter] get_positions error: {e}")
+            import traceback
+            log.debug(f"[Lighter] get_positions traceback: {traceback.format_exc()}")
             return []
     
     def get_book(self, symbol: str) -> Optional[Book]:

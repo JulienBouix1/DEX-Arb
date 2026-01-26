@@ -60,6 +60,7 @@ class Hyperliquid(VenueBase):
         self._send_queue: asyncio.Queue = asyncio.Queue()
         self._subs: set[str] = set()
         self._last_sub_ts: Dict[str, float] = {}
+        self._confirmed_subs: set[str] = set()  # Track confirmed subscriptions for diagnostics
         self._books: Dict[str, Book] = {}
         self._bbo: Dict[str, Tuple[float, float]] = {}  # symbol->(bid,ask)
         self._bbo_ts: Dict[str, float] = {}  # symbol->timestamp of last BBO update
@@ -73,6 +74,7 @@ class Hyperliquid(VenueBase):
         self._reader_task: Optional[asyncio.Task] = None
         self._writer_task: Optional[asyncio.Task] = None
         self._sub_task: Optional[asyncio.Task] = None
+        self._staleness_task: Optional[asyncio.Task] = None
 
         # stats
         self._last_hb: float = 0.0
@@ -97,11 +99,13 @@ class Hyperliquid(VenueBase):
         self._reader_task = asyncio.create_task(self._ws_reader_loop(), name="hl_ws_reader")
         self._writer_task = asyncio.create_task(self._ws_writer_loop(), name="hl_ws_writer")
         self._sub_task = asyncio.create_task(self._sub_throttle_loop(), name="hl_ws_sub_throttle")
+        # DISABLED: Staleness monitor was causing connection instability by forcing reconnects
+        # self._staleness_task = asyncio.create_task(self._staleness_monitor_loop(), name="hl_staleness_monitor")
         # self._ping_task = asyncio.create_task(self._ping_loop(), name="hl_ws_ping")
         await asyncio.wait_for(self._connected.wait(), timeout=15)
 
     async def close(self) -> None:
-        for t in (self._reader_task, self._writer_task, self._sub_task, getattr(self, "_ping_task", None)):
+        for t in (self._reader_task, self._writer_task, self._sub_task, self._staleness_task, getattr(self, "_ping_task", None)):
             if t:
                 t.cancel()
         if self._ws:
@@ -131,6 +135,37 @@ class Hyperliquid(VenueBase):
         self._subs.add(coin)
         await self._enqueue_subscribe(coin)
 
+    async def subscribe_tickers(self, symbols: List[str]) -> None:
+        """Subscribe to real-time ticker/BBO updates for symbols."""
+        for symbol in symbols:
+            await self.subscribe_orderbook(symbol)
+
+    def is_ws_healthy(self, max_age_ms: float = 5000.0) -> bool:
+        """
+        Check if WebSocket is connected and receiving data.
+        FIX 2026-01-22: Added to detect WS disconnects that leave stale prices.
+
+        Returns True only if:
+        1. _connected event is set (WS appears connected)
+        2. At least one subscribed symbol has fresh data (< max_age_ms)
+        """
+        if not self._connected.is_set():
+            return False
+
+        if not self._subs:
+            # No subscriptions yet, consider healthy
+            return True
+
+        # Check if ANY symbol has fresh data
+        now = time.time()
+        for coin in self._subs:
+            ts = self._bbo_ts.get(coin.upper(), 0.0)
+            if ts > 0 and (now - ts) * 1000 < max_age_ms:
+                return True
+
+        # All subscribed symbols have stale data = unhealthy
+        return False
+
     def get_bbo(self, coin: str) -> Optional[Tuple[float, float]]:
         return self._bbo.get(coin.upper())
     
@@ -145,7 +180,18 @@ class Hyperliquid(VenueBase):
                 return ((bbo[0], 0.0), (bbo[1], 0.0))
             return None
         return ((book.bids[0][0], book.bids[0][1]), (book.asks[0][0], book.asks[0][1]))
-    
+
+    def get_aggregated_depth_usd(self, coin: str, levels: int = 5) -> float:
+        """Sum depth across multiple orderbook levels for more accurate liquidity estimate."""
+        coin = coin.upper()
+        book = self._books.get(coin)
+        if not book or not book.bids or not book.asks:
+            return 0.0
+        mid = (book.bids[0][0] + book.asks[0][0]) / 2
+        bid_depth = sum(sz for _, sz in book.bids[:levels])
+        ask_depth = sum(sz for _, sz in book.asks[:levels])
+        return min(bid_depth, ask_depth) * mid
+
     def get_bbo_age_ms(self, coin: str) -> float:
         """Return age of BBO in milliseconds. Returns large value if no BBO."""
         ts = self._bbo_ts.get(coin.upper(), 0.0)
@@ -166,10 +212,19 @@ class Hyperliquid(VenueBase):
                     log.warning(f"[HL] REST BBO fetch failed: status={r.status} text={await r.text()}")
                     return None
                 data = await r.json()
+                # FIX: Check if data is None before calling .get()
+                if not data or not isinstance(data, dict):
+                    log.debug(f"[HL] REST BBO fetch returned invalid data: {type(data)}")  # Reduced from WARNING - handled gracefully
+                    return None
                 levels = data.get("levels") or []
-                if len(levels) >= 2 and levels[0] and levels[1]:
-                    best_bid = float(levels[0][0].get("px", 0))
-                    best_ask = float(levels[1][0].get("px", 0))
+                # FIX: Robust null checking to prevent NoneType.get() errors
+                if (len(levels) >= 2 and
+                    levels[0] and isinstance(levels[0], list) and len(levels[0]) > 0 and
+                    levels[1] and isinstance(levels[1], list) and len(levels[1]) > 0 and
+                    levels[0][0] and isinstance(levels[0][0], dict) and
+                    levels[1][0] and isinstance(levels[1][0], dict)):
+                    best_bid = float(levels[0][0].get("px", 0) or 0)
+                    best_ask = float(levels[1][0].get("px", 0) or 0)
                     if best_bid > 0 and best_ask > 0:
                         # Update cached BBO
                         self._bbo[coin.upper()] = (best_bid, best_ask)
@@ -250,17 +305,18 @@ class Hyperliquid(VenueBase):
 
     async def get_positions(self) -> List[Dict[str, Any]]:
         """Fetch all open positions from Hyperliquid.
-        Returns list of dicts with standardized keys: symbol, size, entry.
+        Returns list of dicts with standardized keys: symbol, size, size_usd, entry.
+        FIX 2026-01-22: Added size_usd from API's positionValue field for accurate USD comparison.
         """
         if not self.user_address:
             return []
         try:
             if not self._session or self._session.closed:
                 self._session = aiohttp.ClientSession(connector=get_connector(), timeout=aiohttp.ClientTimeout(total=10))
-            
+
             url = f"{self.rest_url}/info"
             payload = {"type": "clearinghouseState", "user": self.user_address}
-            
+
             async with self._session.post(url, json=payload) as r:
                 if r.status != 200:
                     log.warning(f"[HL] get_positions failed: status={r.status}")
@@ -268,18 +324,29 @@ class Hyperliquid(VenueBase):
                 data = await r.json()
                 # Structure: {"marginSummary": {...}, "assetPositions": [...]}
                 asset_positions = data.get("assetPositions", [])
-                
+
                 positions = []
                 for ap in asset_positions:
                     pos_data = ap.get("position", {})
                     coin = str(pos_data.get("coin", "")).upper()
-                    szi = float(pos_data.get("szi", 0) or 0)  # Signed size
+                    szi = float(pos_data.get("szi", 0) or 0)  # Signed size in coins
                     entry_px = float(pos_data.get("entryPx", 0) or 0)
-                    
+                    # FIX 2026-01-22: Use positionValue for USD value (more accurate)
+                    position_value = float(pos_data.get("positionValue", 0) or 0)
+                    # Fallback: calculate from size * entry if positionValue not available
+                    size_usd = abs(position_value) if position_value != 0 else abs(szi * entry_px)
+
+                    # FIX 2026-01-25: Add USD threshold to filter dust positions at source
+                    # Prevents orphan alerts for tiny residuals from partial fills
+                    MIN_POSITION_USD = 10.0
                     if coin and abs(szi) > 0:
+                        if size_usd < MIN_POSITION_USD:
+                            log.debug(f"[HL] Ignoring dust position {coin}: ${size_usd:.2f} < ${MIN_POSITION_USD}")
+                            continue
                         positions.append({
                             "symbol": coin,
-                            "size": szi,
+                            "size": szi,  # Coins (for order calculations)
+                            "size_usd": size_usd,  # USD value (for reconciliation)
                             "entry": entry_px
                         })
                 return positions
@@ -287,12 +354,16 @@ class Hyperliquid(VenueBase):
             log.warning("[HL] get_positions error: %s", e)
             return []
 
-    async def set_isolated_margin(self, coin: str, leverage: int = 5) -> bool:
-        """Set isolated margin mode for a coin before opening positions."""
+    async def set_isolated_margin(self, coin: str, leverage: int = 2) -> bool:
+        """Set isolated margin mode for a coin before opening positions.
+        P0 FIX: Default leverage reduced from 3x to 2x for risk management.
+        """
         return await self._hl.set_isolated_margin(coin, leverage)
-    
-    async def set_leverage(self, coin: str, leverage: int = 5) -> bool:
-        """Set leverage for a coin. Delegates to set_isolated_margin."""
+
+    async def set_leverage(self, coin: str, leverage: int = 2) -> bool:
+        """Set leverage for a coin. Delegates to set_isolated_margin.
+        P0 FIX: Default leverage reduced from 3x to 2x for risk management.
+        """
         return await self.set_isolated_margin(coin, leverage)
     
     async def get_funding_rate(self, coin: str) -> float:
@@ -366,21 +437,120 @@ class Hyperliquid(VenueBase):
         """Fetch full order result."""
         return await self._hl.get_order_status(oid)
 
-    async def cancel_order(self, order_id: str, symbol: Optional[str] = None) -> bool:
+    async def cancel_order(self, order_id: Any, symbol: str) -> Dict[str, Any]:
         """
         Cancel an open order on Hyperliquid.
 
-        Note: HL SDK cancel requires coin name and order ID.
-        This is a simplified implementation.
+        Args:
+            order_id: The order ID (int or string) to cancel
+            symbol: The coin symbol (e.g., "BTC", "ETH")
+
+        Returns:
+            Dict with 'status' key: 'cancelled' on success, 'error' on failure
         """
+        if not symbol:
+            return {"status": "error", "reason": "Symbol required for HL cancel"}
         try:
-            # HL cancel requires coin, but we might not have it
-            # For now, log and return False as this needs SDK enhancement
-            log.warning(f"[HL] cancel_order called for {order_id} - not fully implemented")
-            return False
+            oid = int(order_id) if order_id else 0
+            if oid <= 0:
+                return {"status": "error", "reason": "Invalid order_id"}
+            return await self._hl.cancel_order(symbol, oid)
+        except ValueError:
+            return {"status": "error", "reason": f"Cannot convert order_id to int: {order_id}"}
         except Exception as e:
             log.error(f"[HL] cancel_order error: {e}")
-            return False
+            return {"status": "error", "reason": str(e)}
+
+    async def wait_for_fill(
+        self,
+        order_id: Any,
+        symbol: str,
+        expected_qty: float,
+        timeout_s: float = 60.0,
+        poll_interval: float = 2.0
+    ) -> Dict[str, Any]:
+        """
+        Wait for a limit order to fill, polling order status.
+
+        Args:
+            order_id: The order ID to monitor
+            symbol: The coin symbol (e.g., "BTC")
+            expected_qty: Expected fill quantity
+            timeout_s: Maximum wait time (default 60s)
+            poll_interval: Polling frequency (default 2s)
+
+        Returns:
+            Dict with keys: filled, avg_price, is_maker, status
+            status is one of: 'filled', 'partial', 'timeout', 'cancelled'
+        """
+        if not order_id:
+            return {"filled": 0.0, "avg_price": 0.0, "is_maker": False, "status": "error"}
+
+        try:
+            oid = int(order_id)
+        except (ValueError, TypeError):
+            return {"filled": 0.0, "avg_price": 0.0, "is_maker": False, "status": "error"}
+
+        start_time = time.time()
+        last_filled = 0.0
+
+        while (time.time() - start_time) < timeout_s:
+            try:
+                status = await self._hl.get_order_status(oid)
+                if not status:
+                    await asyncio.sleep(poll_interval)
+                    continue
+
+                # Parse order status from HL API response
+                # Response format: {"order": {...}, "status": "filled"/"open"/"cancelled"}
+                order_info = status.get("order", status)
+                filled = 0.0
+                avg_price = 0.0
+
+                # Try to extract fill info from various response formats
+                if isinstance(order_info, dict):
+                    filled = float(order_info.get("totalSz", 0.0) or
+                                   order_info.get("filledSz", 0.0) or
+                                   order_info.get("filled", 0.0) or 0.0)
+                    avg_price = float(order_info.get("avgPx", 0.0) or
+                                      order_info.get("avgPrice", 0.0) or 0.0)
+
+                    order_status = order_info.get("status", "").lower()
+                    if order_status in ("filled", "closed") or filled >= expected_qty * 0.95:
+                        log.info(f"[HL] Order {oid} filled: {filled:.6f} @ ${avg_price:.4f}")
+                        return {
+                            "filled": filled,
+                            "avg_price": avg_price,
+                            "is_maker": True,
+                            "status": "filled"
+                        }
+
+                    if order_status == "cancelled":
+                        return {
+                            "filled": filled,
+                            "avg_price": avg_price,
+                            "is_maker": filled > 0,
+                            "status": "cancelled"
+                        }
+
+                if filled > last_filled:
+                    log.debug(f"[HL] Order {oid} partial fill: {filled:.6f}/{expected_qty:.6f}")
+                    last_filled = filled
+
+            except Exception as e:
+                log.warning(f"[HL] wait_for_fill poll error: {e}")
+
+            await asyncio.sleep(poll_interval)
+
+        # Timeout - return partial fill info
+        elapsed = time.time() - start_time
+        log.info(f"[HL] Order {oid} timeout after {elapsed:.1f}s, filled={last_filled:.6f}")
+        return {
+            "filled": last_filled,
+            "avg_price": 0.0,  # Unknown if partial
+            "is_maker": last_filled > 0,
+            "status": "timeout"
+        }
 
     # ---------- Internal WS ----------
     async def _ws_reader_loop(self) -> None:
@@ -409,8 +579,8 @@ class Hyperliquid(VenueBase):
                 # Note: websockets library handles SNI properly with 'host' parameter
                 async with websockets.connect(
                     self.ws_url, 
-                    ping_interval=15,   # Ping every 15s (more lenient)
-                    ping_timeout=20,    # Wait 20s for pong
+                    ping_interval=5,    # Ping every 5s (faster dead connection detection)
+                    ping_timeout=10,    # Wait 10s for pong
                     close_timeout=5,    # Give more time for graceful close
                     open_timeout=30     # Longer timeout for initial connection
                 ) as ws:
@@ -493,6 +663,43 @@ class Hyperliquid(VenueBase):
                 log.error("[HL-WRITER] Loop error: %s", e)
                 await asyncio.sleep(1.0)
 
+    async def _staleness_monitor_loop(self) -> None:
+        """Monitor for stale price data and force reconnect if needed."""
+        STALE_THRESHOLD_MS = 5000.0   # 5 seconds (reduced for faster staleness detection)
+        CHECK_INTERVAL_S = 2.0        # Check every 2s for quicker response
+
+        while True:
+            try:
+                await asyncio.sleep(CHECK_INTERVAL_S)
+                if not self._subs or not self._connected.is_set():
+                    continue
+
+                stale_symbols = []
+                for coin in list(self._subs):
+                    age_ms = self.get_bbo_age_ms(coin)
+                    if age_ms > STALE_THRESHOLD_MS:
+                        stale_symbols.append((coin, age_ms))
+
+                if stale_symbols:
+                    # FIX 2026-01-22: Reduced to debug - staleness handled silently in background
+                    log.debug("[HL] STALENESS: %d symbols stale (>%.0fs): %s",
+                        len(stale_symbols), STALE_THRESHOLD_MS / 1000,
+                        ", ".join(f"{s}:{int(age)}ms" for s, age in stale_symbols[:5]))
+
+                    # If >50% of symbols are stale, force reconnect
+                    if len(stale_symbols) > len(self._subs) * 0.5:
+                        log.debug("[HL] >50%% symbols stale - forcing WS reconnect")
+                        if self._ws:
+                            try:
+                                await self._ws.close()
+                            except Exception:
+                                pass
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                log.debug("[HL] Staleness monitor error: %s", e)
+                await asyncio.sleep(5.0)
+
     async def _sub_throttle_loop(self) -> None:
         # Periodically re-enqueue subscriptions (once per RESUB_MIN_PERIOD_S)
         while True:
@@ -534,7 +741,13 @@ class Hyperliquid(VenueBase):
         d = data.get("data") or {}
         
         if ch == "subscriptionResponse":
-            # Subscription acknowledgement - ignore
+            # Track confirmed subscriptions for diagnostics
+            method = d.get("method", "")
+            sub = d.get("subscription", {})
+            coin = sub.get("coin")
+            if method == "subscribe" and coin:
+                self._confirmed_subs.add(coin.upper())
+                log.debug("[HL] Subscription confirmed for %s", coin)
             return
         elif ch == "l2Book":
             coin = str(d.get("coin", "")).upper()
